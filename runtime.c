@@ -30,12 +30,14 @@ extern "C" {
 int putchar(int c);
 long write(int fd, const void *buf, size_t n);
 void *malloc(size_t size);
+void *realloc(void *ptr, size_t size);
 void free(void *ptr);
 void *memset(void *dst, int c, size_t n);
 void *memcpy(void *dst, const void *src, size_t n);
 void *memmove(void *dst, const void *src, size_t n);
 size_t strlen(const char *s);
 int strcmp(const char *s1, const char *s2);
+int strncmp(const char *s1, const char *s2, size_t n);
 int memcmp(const void *s1, const void *s2, size_t n);
 _Noreturn void exit(int status);
 _Noreturn void abort(void);
@@ -297,6 +299,7 @@ MOONBIT_EXPORT void moonbit_decref(void *ptr) {
 #if defined(MOONBIT_ALLOW_STACKTRACE) && !defined(__TINYC__)
 
 // Forward declaration
+static const char *demangle(const char *func_name, char **owned_out);
 static void error_callback(void *data, const char *msg, int errnum);
 
 typedef struct {
@@ -341,7 +344,8 @@ static int symbolize_callback(void *data, uintptr_t pc, const char *filename, in
     return 0;
   }
 
-  const char *func_name = function ? function : "???";
+  char *owned_name = NULL;
+  const char *func_name = function ? demangle(function, &owned_name) : "???";
   const char *file_name = filename ? filename : "???";
 
   if (bt_data->use_color) {
@@ -353,6 +357,7 @@ static int symbolize_callback(void *data, uintptr_t pc, const char *filename, in
   }
 
   bt_data->count++;
+  free(owned_name);
   return 0;
 }
 
@@ -540,6 +545,700 @@ static uint32_t moonbit__bt_level = 0;
 #define MOONBIT_NATIVE_BT_MAX_FRAMES 64
 #endif
 
+typedef struct {
+  char *buf;
+  size_t len;
+  size_t cap;
+} mbt_str;
+
+static int mbt_str_reserve(mbt_str *s, size_t extra) {
+  if (s->len + extra + 1 <= s->cap)
+    return 1;
+  size_t next_cap = s->cap ? s->cap : 64;
+  while (next_cap < s->len + extra + 1)
+    next_cap *= 2;
+  char *next = (char *)realloc(s->buf, next_cap);
+  if (!next)
+    return 0;
+  s->buf = next;
+  s->cap = next_cap;
+  return 1;
+}
+
+static int mbt_str_init(mbt_str *s) {
+  s->buf = NULL;
+  s->len = 0;
+  s->cap = 0;
+  return mbt_str_reserve(s, 0);
+}
+
+static int mbt_str_append_char(mbt_str *s, char c) {
+  if (!mbt_str_reserve(s, 1))
+    return 0;
+  s->buf[s->len++] = c;
+  s->buf[s->len] = 0;
+  return 1;
+}
+
+static int mbt_str_append_cstr(mbt_str *s, const char *cstr) {
+  if (!cstr)
+    return 1;
+  for (size_t i = 0; cstr[i]; i++) {
+    if (!mbt_str_append_char(s, cstr[i]))
+      return 0;
+  }
+  return 1;
+}
+
+static int mbt_str_append_n(mbt_str *s, const char *cstr, size_t n) {
+  if (!cstr || n == 0)
+    return 1;
+  if (!mbt_str_reserve(s, n))
+    return 0;
+  memcpy(s->buf + s->len, cstr, n);
+  s->len += n;
+  s->buf[s->len] = 0;
+  return 1;
+}
+
+static char *mbt_str_release(mbt_str *s) {
+  char *out = s->buf;
+  s->buf = NULL;
+  s->len = 0;
+  s->cap = 0;
+  return out;
+}
+
+static int mbt_parse_u32(const char **p, uint32_t *out) {
+  const char *cur = *p;
+  if (*cur < '0' || *cur > '9')
+    return 0;
+  uint32_t v = 0;
+  while (*cur >= '0' && *cur <= '9') {
+    uint32_t d = (uint32_t)(*cur - '0');
+    v = v * 10 + d;
+    cur++;
+  }
+  *p = cur;
+  *out = v;
+  return 1;
+}
+
+static int mbt_hex_value(char c) {
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  if (c >= 'a' && c <= 'f')
+    return 10 + (c - 'a');
+  if (c >= 'A' && c <= 'F')
+    return 10 + (c - 'A');
+  return -1;
+}
+
+static int mbt_parse_identifier(const char **p, char **out) {
+  uint32_t n = 0;
+  if (!mbt_parse_u32(p, &n))
+    return 0;
+  const char *start = *p;
+  size_t remaining = strlen(start);
+  if (remaining < (size_t)n)
+    return 0;
+  *p = start + n;
+
+  mbt_str decoded;
+  if (!mbt_str_init(&decoded))
+    return 0;
+  for (uint32_t i = 0; i < n; i++) {
+    char c = start[i];
+    if (c != '_') {
+      if (!mbt_str_append_char(&decoded, c)) {
+        free(decoded.buf);
+        return 0;
+      }
+      continue;
+    }
+    if (i + 1 >= n) {
+      free(decoded.buf);
+      return 0;
+    }
+    char next = start[i + 1];
+    if (next == '_') {
+      if (!mbt_str_append_char(&decoded, '_')) {
+        free(decoded.buf);
+        return 0;
+      }
+      i += 1;
+      continue;
+    }
+    if (i + 2 >= n) {
+      free(decoded.buf);
+      return 0;
+    }
+    int hi = mbt_hex_value(start[i + 1]);
+    int lo = mbt_hex_value(start[i + 2]);
+    if (hi < 0 || lo < 0) {
+      free(decoded.buf);
+      return 0;
+    }
+    char v = (char)((hi << 4) | lo);
+    if (!mbt_str_append_char(&decoded, v)) {
+      free(decoded.buf);
+      return 0;
+    }
+    i += 2;
+  }
+  *out = mbt_str_release(&decoded);
+  return 1;
+}
+
+static int mbt_parse_package_segments(const char **p, uint32_t count,
+                                      char **out_pkg) {
+  mbt_str pkg;
+  if (!mbt_str_init(&pkg))
+    return 0;
+  for (uint32_t i = 0; i < count; i++) {
+    char *seg = NULL;
+    if (!mbt_parse_identifier(p, &seg)) {
+      free(pkg.buf);
+      return 0;
+    }
+    if (i > 0 && !mbt_str_append_char(&pkg, '/')) {
+      free(seg);
+      free(pkg.buf);
+      return 0;
+    }
+    if (!mbt_str_append_cstr(&pkg, seg)) {
+      free(seg);
+      free(pkg.buf);
+      return 0;
+    }
+    free(seg);
+  }
+  *out_pkg = mbt_str_release(&pkg);
+  return 1;
+}
+
+static int mbt_parse_package(const char **p, char **out_pkg) {
+  if (**p != 'P')
+    return 0;
+  (*p)++;
+
+  const char *count_start = *p;
+  uint32_t count = 0;
+  if (!mbt_parse_u32(p, &count))
+    return 0;
+  if (mbt_parse_package_segments(p, count, out_pkg))
+    return 1;
+
+  *p = count_start;
+  if (**p < '0' || **p > '9')
+    return 0;
+  count = (uint32_t)(**p - '0');
+  (*p)++;
+  return mbt_parse_package_segments(p, count, out_pkg);
+}
+
+static int mbt_pkg_is_core(const char *pkg) {
+  if (!pkg || !pkg[0])
+    return 0;
+  const char *prefix = "moonbitlang/core";
+  size_t n = strlen(prefix);
+  if (strncmp(pkg, prefix, n) != 0)
+    return 0;
+  return pkg[n] == 0 || pkg[n] == '/';
+}
+
+static int mbt_append_type_path(const char **p, mbt_str *out,
+                                int omit_core_prefix) {
+  char *pkg = NULL;
+  char *type = NULL;
+  if (!mbt_parse_package(p, &pkg))
+    return 0;
+  if (!mbt_parse_identifier(p, &type)) {
+    free(pkg);
+    return 0;
+  }
+  if (**p == 'L') {
+    (*p)++;
+    char *local = NULL;
+    if (!mbt_parse_identifier(p, &local)) {
+      free(pkg);
+      free(type);
+      return 0;
+    }
+    mbt_str combined;
+    if (!mbt_str_init(&combined)) {
+      free(pkg);
+      free(type);
+      free(local);
+      return 0;
+    }
+    if (!mbt_str_append_cstr(&combined, type) ||
+        !mbt_str_append_char(&combined, '.') ||
+        !mbt_str_append_cstr(&combined, local)) {
+      free(pkg);
+      free(type);
+      free(local);
+      free(combined.buf);
+      return 0;
+    }
+    free(type);
+    free(local);
+    type = mbt_str_release(&combined);
+  }
+
+  const char *pkg_use = pkg;
+  if (omit_core_prefix && mbt_pkg_is_core(pkg))
+    pkg_use = "";
+
+  if (!mbt_str_append_char(out, '@')) {
+    free(pkg);
+    free(type);
+    return 0;
+  }
+  if (pkg_use && pkg_use[0]) {
+    if (!mbt_str_append_cstr(out, pkg_use) ||
+        !mbt_str_append_char(out, '.')) {
+      free(pkg);
+      free(type);
+      return 0;
+    }
+  }
+  if (!mbt_str_append_cstr(out, type)) {
+    free(pkg);
+    free(type);
+    return 0;
+  }
+  free(pkg);
+  free(type);
+  return 1;
+}
+
+static int mbt_parse_type_arg(const char **p, mbt_str *out);
+
+static int mbt_parse_type_args(const char **p, mbt_str *out) {
+  if (**p == 'H') {
+    (*p)++;
+    if (!mbt_str_append_cstr(out, " raise "))
+      return 0;
+    return mbt_parse_type_arg(p, out);
+  }
+  if (**p != 'G')
+    return 1;
+  (*p)++;
+  if (!mbt_str_append_char(out, '['))
+    return 0;
+  int first = 1;
+  while (**p && **p != 'E') {
+    if (!first) {
+      if (!mbt_str_append_cstr(out, ", "))
+        return 0;
+    }
+    if (!mbt_parse_type_arg(p, out))
+      return 0;
+    first = 0;
+  }
+  if (**p != 'E')
+    return 0;
+  (*p)++;
+  if (!mbt_str_append_char(out, ']'))
+    return 0;
+  if (**p == 'H') {
+    (*p)++;
+    if (!mbt_str_append_cstr(out, " raise "))
+      return 0;
+    if (!mbt_parse_type_arg(p, out))
+      return 0;
+  }
+  return 1;
+}
+
+static int mbt_parse_fn_type(const char **p, mbt_str *out, int async_mark) {
+  if (**p != 'W')
+    return 0;
+  (*p)++;
+  if (async_mark && !mbt_str_append_cstr(out, "async "))
+    return 0;
+  if (!mbt_str_append_char(out, '('))
+    return 0;
+  int first = 1;
+  while (**p && **p != 'E') {
+    if (!first) {
+      if (!mbt_str_append_cstr(out, ", "))
+        return 0;
+    }
+    if (!mbt_parse_type_arg(p, out))
+      return 0;
+    first = 0;
+  }
+  if (**p != 'E')
+    return 0;
+  (*p)++;
+  if (!mbt_str_append_cstr(out, ") -> "))
+    return 0;
+  if (!mbt_parse_type_arg(p, out))
+    return 0;
+  if (**p == 'Q') {
+    (*p)++;
+    if (!mbt_str_append_cstr(out, " raise "))
+      return 0;
+    if (!mbt_parse_type_arg(p, out))
+      return 0;
+  }
+  return 1;
+}
+
+static int mbt_parse_type_ref(const char **p, mbt_str *out) {
+  if (**p != 'R')
+    return 0;
+  (*p)++;
+  if (!mbt_append_type_path(p, out, 0))
+    return 0;
+  if (**p == 'G') {
+    if (!mbt_parse_type_args(p, out))
+      return 0;
+  }
+  return 1;
+}
+
+static int mbt_parse_type_arg(const char **p, mbt_str *out) {
+  char c = **p;
+  if (!c)
+    return 0;
+  switch (c) {
+    case 'i': (*p)++; return mbt_str_append_cstr(out, "Int");
+    case 'l': (*p)++; return mbt_str_append_cstr(out, "Int64");
+    case 'h': (*p)++; return mbt_str_append_cstr(out, "Int16");
+    case 'j': (*p)++; return mbt_str_append_cstr(out, "UInt");
+    case 'k': (*p)++; return mbt_str_append_cstr(out, "UInt16");
+    case 'm': (*p)++; return mbt_str_append_cstr(out, "UInt64");
+    case 'd': (*p)++; return mbt_str_append_cstr(out, "Double");
+    case 'f': (*p)++; return mbt_str_append_cstr(out, "Float");
+    case 'b': (*p)++; return mbt_str_append_cstr(out, "Bool");
+    case 'c': (*p)++; return mbt_str_append_cstr(out, "Char");
+    case 's': (*p)++; return mbt_str_append_cstr(out, "String");
+    case 'u': (*p)++; return mbt_str_append_cstr(out, "Unit");
+    case 'y': (*p)++; return mbt_str_append_cstr(out, "Byte");
+    case 'z': (*p)++; return mbt_str_append_cstr(out, "Bytes");
+    case 'A': {
+      (*p)++;
+      if (!mbt_str_append_cstr(out, "FixedArray["))
+        return 0;
+      if (!mbt_parse_type_arg(p, out))
+        return 0;
+      return mbt_str_append_char(out, ']');
+    }
+    case 'O': {
+      (*p)++;
+      if (!mbt_str_append_cstr(out, "Option["))
+        return 0;
+      if (!mbt_parse_type_arg(p, out))
+        return 0;
+      return mbt_str_append_char(out, ']');
+    }
+    case 'U': {
+      (*p)++;
+      if (!mbt_str_append_char(out, '('))
+        return 0;
+      int first = 1;
+      while (**p && **p != 'E') {
+        if (!first) {
+          if (!mbt_str_append_cstr(out, ", "))
+            return 0;
+        }
+        if (!mbt_parse_type_arg(p, out))
+          return 0;
+        first = 0;
+      }
+      if (**p != 'E')
+        return 0;
+      (*p)++;
+      return mbt_str_append_char(out, ')');
+    }
+    case 'V':
+      (*p)++;
+      return mbt_parse_fn_type(p, out, 1);
+    case 'W':
+      return mbt_parse_fn_type(p, out, 0);
+    case 'R':
+      return mbt_parse_type_ref(p, out);
+    default:
+      return 0;
+  }
+}
+
+static int mbt_strip_suffix(const char *s, const char *suffix, size_t *out_len) {
+  size_t slen = strlen(s);
+  size_t n = strlen(suffix);
+  if (slen >= n && memcmp(s + slen - n, suffix, n) == 0) {
+    *out_len = slen - n;
+    return 1;
+  }
+  *out_len = slen;
+  return 0;
+}
+
+static int demangle_tag_F(const char **p, mbt_str *out) {
+  int ok = 1;
+  char *pkg = NULL;
+  char *name = NULL;
+  if (!mbt_parse_package(p, &pkg) || !mbt_parse_identifier(p, &name)) {
+    ok = 0;
+  } else if (!mbt_str_append_char(out, '@') ||
+             (pkg && pkg[0] && (!mbt_str_append_cstr(out, pkg) ||
+                                !mbt_str_append_char(out, '.'))) ||
+             !mbt_str_append_cstr(out, name)) {
+    ok = 0;
+  }
+  free(pkg);
+  free(name);
+  while (ok && **p == 'N') {
+    (*p)++;
+    char *nested = NULL;
+    if (!mbt_parse_identifier(p, &nested)) {
+      ok = 0;
+    } else if (!mbt_str_append_char(out, '.') ||
+               !mbt_str_append_cstr(out, nested)) {
+      ok = 0;
+    }
+    free(nested);
+  }
+  if (ok && **p == 'C') {
+    (*p)++;
+    const char *start = *p;
+    while (**p >= '0' && **p <= '9')
+      (*p)++;
+    size_t digits_len = (size_t)(*p - start);
+    if (digits_len == 0) {
+      ok = 0;
+    } else if (!mbt_str_append_char(out, '.') ||
+               !mbt_str_append_n(out, start, digits_len) ||
+               !mbt_str_append_cstr(out, " (the ") ||
+               !mbt_str_append_n(out, start, digits_len) ||
+               !mbt_str_append_cstr(out, "-th anonymous-function)")) {
+      ok = 0;
+    }
+  }
+  if (ok && (**p == 'G' || **p == 'H')) {
+    if (!mbt_parse_type_args(p, out))
+      ok = 0;
+  }
+  return ok;
+}
+
+static int demangle_tag_M(const char **p, mbt_str *out) {
+  int ok = 1;
+  char *pkg = NULL;
+  char *type = NULL;
+  char *name = NULL;
+  if (!mbt_parse_package(p, &pkg) || !mbt_parse_identifier(p, &type) ||
+      !mbt_parse_identifier(p, &name)) {
+    ok = 0;
+  } else if (!mbt_str_append_char(out, '@') ||
+             (pkg && pkg[0] && (!mbt_str_append_cstr(out, pkg) ||
+                                !mbt_str_append_char(out, '.'))) ||
+             !mbt_str_append_cstr(out, type) ||
+             !mbt_str_append_cstr(out, "::") ||
+             !mbt_str_append_cstr(out, name)) {
+    ok = 0;
+  }
+  free(pkg);
+  free(type);
+  free(name);
+  if (ok && (**p == 'G' || **p == 'H')) {
+    if (!mbt_parse_type_args(p, out))
+      ok = 0;
+  }
+  return ok;
+}
+
+static int demangle_tag_I(const char **p, mbt_str *out) {
+  int ok = 1;
+  mbt_str impl_type;
+  mbt_str trait_type;
+  mbt_str type_args;
+  int impl_inited = 0;
+  int trait_inited = 0;
+  int args_inited = 0;
+
+  if (mbt_str_init(&impl_type))
+    impl_inited = 1;
+  if (mbt_str_init(&trait_type))
+    trait_inited = 1;
+  if (mbt_str_init(&type_args))
+    args_inited = 1;
+  if (!impl_inited || !trait_inited || !args_inited)
+    ok = 0;
+
+  if (ok && (!mbt_append_type_path(p, &impl_type, 0) ||
+             !mbt_append_type_path(p, &trait_type, 0)))
+    ok = 0;
+
+  char *name = NULL;
+  if (ok && !mbt_parse_identifier(p, &name))
+    ok = 0;
+  if (ok && (**p == 'G' || **p == 'H')) {
+    if (!mbt_parse_type_args(p, &type_args))
+      ok = 0;
+  }
+
+  if (ok && (!mbt_str_append_cstr(out, "impl ") ||
+             !mbt_str_append_cstr(out, trait_type.buf) ||
+             !mbt_str_append_cstr(out, " for ") ||
+             !mbt_str_append_cstr(out, impl_type.buf) ||
+             (type_args.len && !mbt_str_append_cstr(out, type_args.buf)) ||
+             !mbt_str_append_cstr(out, " with ") ||
+             !mbt_str_append_cstr(out, name)))
+    ok = 0;
+
+  if (impl_inited)
+    free(impl_type.buf);
+  if (trait_inited)
+    free(trait_type.buf);
+  if (args_inited)
+    free(type_args.buf);
+  free(name);
+  return ok;
+}
+
+static int demangle_tag_E(const char **p, mbt_str *out) {
+  int ok = 1;
+  char *type_pkg = NULL;
+  char *type_name = NULL;
+  char *method_pkg = NULL;
+  char *method_name = NULL;
+  if (!mbt_parse_package(p, &type_pkg) ||
+      !mbt_parse_identifier(p, &type_name) ||
+      !mbt_parse_package(p, &method_pkg) ||
+      !mbt_parse_identifier(p, &method_name)) {
+    ok = 0;
+  } else {
+    const char *type_pkg_use = mbt_pkg_is_core(type_pkg) ? "" : type_pkg;
+    if (!mbt_str_append_char(out, '@') ||
+        (method_pkg && method_pkg[0] && (!mbt_str_append_cstr(out, method_pkg) ||
+                                         !mbt_str_append_char(out, '.')))) {
+      ok = 0;
+    }
+    if (ok && type_pkg_use && type_pkg_use[0]) {
+      if (!mbt_str_append_cstr(out, type_pkg_use) ||
+          !mbt_str_append_char(out, '.'))
+        ok = 0;
+    }
+  if (ok && (!mbt_str_append_cstr(out, type_name) ||
+             !mbt_str_append_cstr(out, "::") ||
+             !mbt_str_append_cstr(out, method_name))) {
+    ok = 0;
+  }
+  if (ok && (**p == 'G' || **p == 'H')) {
+    if (!mbt_parse_type_args(p, out))
+      ok = 0;
+  }
+  }
+  free(type_pkg);
+  free(type_name);
+  free(method_pkg);
+  free(method_name);
+  return ok;
+}
+
+static int demangle_tag_T(const char **p, mbt_str *out) {
+  return mbt_append_type_path(p, out, 0);
+}
+
+static int demangle_tag_L(const char **p, mbt_str *out) {
+  int ok = 1;
+  if (**p == 'm')
+    (*p)++;
+  char *ident = NULL;
+  if (!mbt_parse_identifier(p, &ident)) {
+    ok = 0;
+  } else if (**p != 'S') {
+    ok = 0;
+  } else {
+    (*p)++;
+    if (!(**p >= '0' && **p <= '9')) {
+      ok = 0;
+    } else {
+      while (**p >= '0' && **p <= '9')
+        (*p)++;
+      const char *use = ident;
+      if (use[0] == '$')
+        use++;
+      size_t use_len = 0;
+      mbt_strip_suffix(use, ".fn", &use_len);
+      if (!mbt_str_append_char(out, '@') ||
+          !mbt_str_append_n(out, use, use_len)) {
+        ok = 0;
+      }
+    }
+  }
+  free(ident);
+  return ok;
+}
+
+static const char *demangle(const char *func_name, char **owned_out) {
+  if (!owned_out)
+    return func_name;
+  *owned_out = NULL;
+  if (!func_name)
+    return NULL;
+  const char *p = func_name;
+  if (p[0] == '$')
+    p++;
+  if (strlen(p) < 3 || p[0] != '_' || p[1] != 'M' || p[2] != '0')
+    return func_name;
+  p += 3;
+
+  mbt_str out;
+  if (!mbt_str_init(&out))
+    return func_name;
+
+  int ok = 1;
+  char tag = *p;
+  if (!tag)
+    ok = 0;
+  if (ok)
+    p++;
+
+  if (ok) {
+    switch (tag) {
+      case 'F':
+        ok = demangle_tag_F(&p, &out);
+        break;
+      case 'M':
+        ok = demangle_tag_M(&p, &out);
+        break;
+      case 'I':
+        ok = demangle_tag_I(&p, &out);
+        break;
+      case 'E':
+        ok = demangle_tag_E(&p, &out);
+        break;
+      case 'T':
+        ok = demangle_tag_T(&p, &out);
+        break;
+      case 'L':
+        ok = demangle_tag_L(&p, &out);
+        break;
+      default:
+        ok = 0;
+        break;
+    }
+  }
+
+  if (ok && *p != '\0') {
+    char c = *p;
+    if (!(c == '.' || c == '$' || c == '@'))
+      ok = 0;
+  }
+
+  if (!ok) {
+    free(out.buf);
+    return func_name;
+  }
+  *owned_out = mbt_str_release(&out);
+  return *owned_out ? *owned_out : func_name;
+}
+
 #ifdef NO_MOONBIT_BACKTRACE_COLORED
 #define MOONBIT__BT_COLOR(x) ""
 #else
@@ -569,6 +1268,9 @@ MOONBIT_EXPORT int moonbit_tcc_backtrace(void *udata, void *pc,
   if (!func) {
     return 1; /* skip this frame */
   }
+
+  char *owned_name = NULL;
+  const char *func_name = demangle(func, &owned_name);
 
   {
     char linebuf[512];
@@ -604,7 +1306,7 @@ MOONBIT_EXPORT int moonbit_tcc_backtrace(void *udata, void *pc,
     moonbit__bt_buf_append_char(linebuf, sizeof linebuf, &len, ' ');
     moonbit__bt_buf_append_cstr(linebuf, sizeof linebuf, &len,
                                 MOONBIT__BT_COLOR("\x1b[1m"));
-    moonbit__bt_buf_append_cstr(linebuf, sizeof linebuf, &len, func);
+    moonbit__bt_buf_append_cstr(linebuf, sizeof linebuf, &len, func_name);
     moonbit__bt_buf_append_cstr(linebuf, sizeof linebuf, &len,
                                 MOONBIT__BT_COLOR("\x1b[0m"));
     moonbit__bt_buf_append_cstr(linebuf, sizeof linebuf, &len, "\n");
@@ -612,6 +1314,7 @@ MOONBIT_EXPORT int moonbit_tcc_backtrace(void *udata, void *pc,
   }
 
   moonbit__bt_level += 1;
+  free(owned_name);
 
   if ((func && 0 == strcmp(func, "main")) ||
       moonbit__bt_level >= (uint32_t)MOONBIT_NATIVE_BT_MAX_FRAMES)
