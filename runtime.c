@@ -64,13 +64,6 @@ _Noreturn void abort(void);
 // Set maximum number of backtrace frames to print.
 #define BACKTRACE_LIMIT 15
 
-#define COLOR_RED_BOLD  "\033[1;31m"
-#define COLOR_RESET     "\033[0m"
-#define COLOR_GREY      "\033[90m"
-#define COLOR_CYAN      "\033[36m"
-#define COLOR_GREEN     "\033[32m"
-#define COLOR_BOLD      "\033[1m"
-
 #endif // #if defined(MOONBIT_ALLOW_STACKTRACE) && !defined(__TINYC__)
 
 #endif
@@ -305,7 +298,6 @@ static void error_callback(void *data, const char *msg, int errnum);
 typedef struct {
   struct backtrace_state *state;
   int count;
-  int use_color;
   int limit_reached;
   int has_meaningful_frame;
   int consecutive_unknown;
@@ -337,8 +329,7 @@ static int symbolize_callback(void *data, uintptr_t pc, const char *filename, in
   }
 
   if (bt_data->count >= BACKTRACE_LIMIT) {
-    if (bt_data->use_color) fprintf(stderr, "    %s...(more frames omitted)%s\n", COLOR_GREY, COLOR_RESET);
-    else fprintf(stderr, "    ...\n");
+    fprintf(stderr, "    ...\n");
     
     bt_data->limit_reached = 1;
     return 0;
@@ -348,13 +339,7 @@ static int symbolize_callback(void *data, uintptr_t pc, const char *filename, in
   const char *func_name = function ? demangle(function, &owned_name) : "???";
   const char *file_name = filename ? filename : "???";
 
-  if (bt_data->use_color) {
-    fprintf(stderr, "    %sat%s %s%s%s %s%s:%d%s\n",
-            COLOR_GREY, COLOR_RESET, COLOR_CYAN, func_name, COLOR_RESET,
-            COLOR_GREEN, file_name, lineno, COLOR_RESET);
-  } else {
-    fprintf(stderr, "    at %s (%s:%d)\n", func_name, file_name, lineno);
-  }
+  fprintf(stderr, "    at %s (%s:%d)\n", func_name, file_name, lineno);
 
   bt_data->count++;
   free(owned_name);
@@ -388,14 +373,8 @@ static void error_callback(void *data, const char *msg, int errnum) {
 
 MOONBIT_EXPORT _Noreturn void moonbit_panic(void) {
 #if defined(MOONBIT_ALLOW_STACKTRACE) && !defined(__TINYC__)
-  int use_color = isatty(fileno(stderr));
   fflush(stdout);
-
-  if (use_color) {
-      fprintf(stderr, "%sPanicError%s\n", COLOR_RED_BOLD, COLOR_RESET);
-  } else {
-      fprintf(stderr, "PanicError\n");
-  }
+  fprintf(stderr, "PanicError\n");
 
   static struct backtrace_state *state = NULL;
   if (!state) {
@@ -418,7 +397,7 @@ MOONBIT_EXPORT _Noreturn void moonbit_panic(void) {
   }
 
   if (state) {
-    mbt_backtrace_data bt_data = {state, 0, use_color, 0, 0, 0, 0};
+    mbt_backtrace_data bt_data = {state, 0, 0, 0, 0, 0};
     _Unwind_Backtrace(unwind_callback, &bt_data);
   }
 #endif // #if defined(MOONBIT_ALLOW_STACKTRACE) && !defined(__TINYC__)
@@ -434,8 +413,8 @@ MOONBIT_EXPORT _Noreturn void moonbit_panic(void) {
 /* Optional: integrate with TinyCC (-run) backtrace facility.
    TinyCC's tccrun.c supports a per-frame callback (TCCBtFunc) when a runtime
    exception / SIGABRT happens. We expose a callback symbol that can be
-   discovered by the host (tcc -run) and used to build a backtrace string,
-   post-process it (e.g. add ANSI colors), and then print it.
+   discovered by the host (tcc -run) and used to build a backtrace string and
+   print it.
 
    Notes:
    - Keep this code independent from libc headers: it must compile with
@@ -471,18 +450,6 @@ static void moonbit__eprint(const char *s) {
   if (!s)
     return;
   moonbit__eprint_n(s, strlen(s));
-}
-
-static const char *moonbit__basename(const char *path) {
-  if (!path)
-    return NULL;
-  const char *p = path;
-  const char *last = path;
-  for (; *p; p++) {
-    if (*p == '/' || *p == '\\')
-      last = p + 1;
-  }
-  return last;
 }
 
 static void moonbit__bt_buf_append_char(char *buf, size_t cap, size_t *len,
@@ -609,6 +576,16 @@ static char *mbt_str_release(mbt_str *s) {
   return out;
 }
 
+static int mbt_dup_cstr(const char *src, char **out) {
+  size_t n = strlen(src);
+  char *dst = (char *)malloc(n + 1);
+  if (!dst)
+    return 0;
+  memcpy(dst, src, n + 1);
+  *out = dst;
+  return 1;
+}
+
 static int mbt_parse_u32(const char **p, uint32_t *out) {
   const char *cur = *p;
   if (*cur < '0' || *cur > '9')
@@ -721,6 +698,46 @@ static int mbt_parse_package(const char **p, char **out_pkg) {
   if (**p != 'P')
     return 0;
   (*p)++;
+
+  if (**p == 'B') {
+    (*p)++;
+    return mbt_dup_cstr("moonbitlang/core/builtin", out_pkg);
+  }
+
+  if (**p == 'C') {
+    (*p)++;
+    const char *count_start = *p;
+    uint32_t count = 0;
+    if (!mbt_parse_u32(p, &count))
+      return 0;
+
+    char *suffix = NULL;
+    if (!mbt_parse_package_segments(p, count, &suffix)) {
+      *p = count_start;
+      if (**p < '0' || **p > '9')
+        return 0;
+      count = (uint32_t)(**p - '0');
+      (*p)++;
+      if (!mbt_parse_package_segments(p, count, &suffix))
+        return 0;
+    }
+
+    mbt_str full;
+    if (!mbt_str_init(&full)) {
+      free(suffix);
+      return 0;
+    }
+    if (!mbt_str_append_cstr(&full, "moonbitlang/core") ||
+        (suffix[0] && (!mbt_str_append_char(&full, '/') ||
+                       !mbt_str_append_cstr(&full, suffix)))) {
+      free(suffix);
+      free(full.buf);
+      return 0;
+    }
+    free(suffix);
+    *out_pkg = mbt_str_release(&full);
+    return 1;
+  }
 
   const char *count_start = *p;
   uint32_t count = 0;
@@ -966,15 +983,83 @@ static int mbt_parse_type_arg(const char **p, mbt_str *out) {
   }
 }
 
-static int mbt_strip_suffix(const char *s, const char *suffix, size_t *out_len) {
-  size_t slen = strlen(s);
-  size_t n = strlen(suffix);
-  if (slen >= n && memcmp(s + slen - n, suffix, n) == 0) {
-    *out_len = slen - n;
-    return 1;
+static int mbt_skip_decimal(const char **p) {
+  if (**p < '0' || **p > '9')
+    return 0;
+  while (**p >= '0' && **p <= '9')
+    (*p)++;
+  return 1;
+}
+
+static int mbt_parse_decimal_span(const char **p, const char **start, size_t *len) {
+  const char *s = *p;
+  if (*s < '0' || *s > '9')
+    return 0;
+  while (**p >= '0' && **p <= '9')
+    (*p)++;
+  *start = s;
+  *len = (size_t)(*p - s);
+  return 1;
+}
+
+static int mbt_parse_lifted_suffixes(const char **p, mbt_str *out) {
+  while (**p == 'N') {
+    (*p)++;
+    char *nested = NULL;
+    if (!mbt_parse_identifier(p, &nested))
+      return 0;
+    if (**p != 'S') {
+      free(nested);
+      return 0;
+    }
+    (*p)++;
+    if (!mbt_skip_decimal(p)) {
+      free(nested);
+      return 0;
+    }
+    if (!mbt_str_append_char(out, '.') || !mbt_str_append_cstr(out, nested)) {
+      free(nested);
+      return 0;
+    }
+    free(nested);
   }
-  *out_len = slen;
-  return 0;
+  return 1;
+}
+
+static int mbt_parse_closure_suffix(const char **p, mbt_str *out) {
+  if (**p != 'C')
+    return 1;
+  (*p)++;
+  if (**p < '0' || **p > '9')
+    return 0;
+
+  const char *uuid = NULL;
+  size_t uuid_len = 0;
+  if (!mbt_parse_decimal_span(p, &uuid, &uuid_len))
+    return 0;
+
+  if (**p == 'l') {
+    const char *line = NULL;
+    size_t line_len = 0;
+    (*p)++;
+    if (!mbt_parse_decimal_span(p, &line, &line_len))
+      return 0;
+    return mbt_str_append_cstr(out, ".anon(l") &&
+           mbt_str_append_n(out, line, line_len) &&
+           mbt_str_append_char(out, ')');
+  }
+
+  (void)uuid;
+  (void)uuid_len;
+  return mbt_str_append_cstr(out, ".anon");
+}
+
+static int mbt_parse_fn_suffixes(const char **p, mbt_str *out) {
+  if (!mbt_parse_lifted_suffixes(p, out))
+    return 0;
+  if (!mbt_parse_closure_suffix(p, out))
+    return 0;
+  return 1;
 }
 
 static int demangle_tag_F(const char **p, mbt_str *out) {
@@ -991,37 +1076,14 @@ static int demangle_tag_F(const char **p, mbt_str *out) {
   }
   free(pkg);
   free(name);
-  while (ok && **p == 'N') {
-    (*p)++;
-    char *nested = NULL;
-    if (!mbt_parse_identifier(p, &nested)) {
-      ok = 0;
-    } else if (!mbt_str_append_char(out, '.') ||
-               !mbt_str_append_cstr(out, nested)) {
-      ok = 0;
-    }
-    free(nested);
-  }
-  if (ok && **p == 'C') {
-    (*p)++;
-    const char *start = *p;
-    while (**p >= '0' && **p <= '9')
-      (*p)++;
-    size_t digits_len = (size_t)(*p - start);
-    if (digits_len == 0) {
-      ok = 0;
-    } else if (!mbt_str_append_char(out, '.') ||
-               !mbt_str_append_n(out, start, digits_len) ||
-               !mbt_str_append_cstr(out, " (the ") ||
-               !mbt_str_append_n(out, start, digits_len) ||
-               !mbt_str_append_cstr(out, "-th anonymous-function)")) {
-      ok = 0;
-    }
-  }
+  if (ok && !mbt_parse_fn_suffixes(p, out))
+    ok = 0;
   if (ok && (**p == 'G' || **p == 'H')) {
     if (!mbt_parse_type_args(p, out))
       ok = 0;
   }
+  if (ok && !mbt_parse_fn_suffixes(p, out))
+    ok = 0;
   return ok;
 }
 
@@ -1044,10 +1106,14 @@ static int demangle_tag_M(const char **p, mbt_str *out) {
   free(pkg);
   free(type);
   free(name);
+  if (ok && !mbt_parse_fn_suffixes(p, out))
+    ok = 0;
   if (ok && (**p == 'G' || **p == 'H')) {
     if (!mbt_parse_type_args(p, out))
       ok = 0;
   }
+  if (ok && !mbt_parse_fn_suffixes(p, out))
+    ok = 0;
   return ok;
 }
 
@@ -1056,9 +1122,11 @@ static int demangle_tag_I(const char **p, mbt_str *out) {
   mbt_str impl_type;
   mbt_str trait_type;
   mbt_str type_args;
+  mbt_str fn_suffix;
   int impl_inited = 0;
   int trait_inited = 0;
   int args_inited = 0;
+  int suffix_inited = 0;
 
   if (mbt_str_init(&impl_type))
     impl_inited = 1;
@@ -1066,7 +1134,9 @@ static int demangle_tag_I(const char **p, mbt_str *out) {
     trait_inited = 1;
   if (mbt_str_init(&type_args))
     args_inited = 1;
-  if (!impl_inited || !trait_inited || !args_inited)
+  if (mbt_str_init(&fn_suffix))
+    suffix_inited = 1;
+  if (!impl_inited || !trait_inited || !args_inited || !suffix_inited)
     ok = 0;
 
   if (ok && (!mbt_append_type_path(p, &impl_type, 0) ||
@@ -1076,10 +1146,14 @@ static int demangle_tag_I(const char **p, mbt_str *out) {
   char *name = NULL;
   if (ok && !mbt_parse_identifier(p, &name))
     ok = 0;
+  if (ok && !mbt_parse_fn_suffixes(p, &fn_suffix))
+    ok = 0;
   if (ok && (**p == 'G' || **p == 'H')) {
     if (!mbt_parse_type_args(p, &type_args))
       ok = 0;
   }
+  if (ok && !mbt_parse_fn_suffixes(p, &fn_suffix))
+    ok = 0;
 
   if (ok && (!mbt_str_append_cstr(out, "impl ") ||
              !mbt_str_append_cstr(out, trait_type.buf) ||
@@ -1087,7 +1161,8 @@ static int demangle_tag_I(const char **p, mbt_str *out) {
              !mbt_str_append_cstr(out, impl_type.buf) ||
              (type_args.len && !mbt_str_append_cstr(out, type_args.buf)) ||
              !mbt_str_append_cstr(out, " with ") ||
-             !mbt_str_append_cstr(out, name)))
+             !mbt_str_append_cstr(out, name) ||
+             (fn_suffix.len && !mbt_str_append_cstr(out, fn_suffix.buf))))
     ok = 0;
 
   if (impl_inited)
@@ -1096,6 +1171,8 @@ static int demangle_tag_I(const char **p, mbt_str *out) {
     free(trait_type.buf);
   if (args_inited)
     free(type_args.buf);
+  if (suffix_inited)
+    free(fn_suffix.buf);
   free(name);
   return ok;
 }
@@ -1128,10 +1205,14 @@ static int demangle_tag_E(const char **p, mbt_str *out) {
              !mbt_str_append_cstr(out, method_name))) {
     ok = 0;
   }
+  if (ok && !mbt_parse_fn_suffixes(p, out))
+    ok = 0;
   if (ok && (**p == 'G' || **p == 'H')) {
     if (!mbt_parse_type_args(p, out))
       ok = 0;
   }
+  if (ok && !mbt_parse_fn_suffixes(p, out))
+    ok = 0;
   }
   free(type_pkg);
   free(type_name);
@@ -1163,10 +1244,7 @@ static int demangle_tag_L(const char **p, mbt_str *out) {
       const char *use = ident;
       if (use[0] == '$')
         use++;
-      size_t use_len = 0;
-      mbt_strip_suffix(use, ".fn", &use_len);
-      if (!mbt_str_append_char(out, '@') ||
-          !mbt_str_append_n(out, use, use_len)) {
+      if (!mbt_str_append_char(out, '@') || !mbt_str_append_cstr(out, use)) {
         ok = 0;
       }
     }
@@ -1239,12 +1317,6 @@ static const char *demangle(const char *func_name, char **owned_out) {
   return *owned_out ? *owned_out : func_name;
 }
 
-#ifdef NO_MOONBIT_BACKTRACE_COLORED
-#define MOONBIT__BT_COLOR(x) ""
-#else
-#define MOONBIT__BT_COLOR(x) x
-#endif
-
 /* TCCBtFunc signature (see vendor/tinycc/libtcc.h):
    int (*)(void *udata, void *pc, const char *file, int line,
            const char* func, const char *msg)
@@ -1259,9 +1331,7 @@ MOONBIT_EXPORT int moonbit_tcc_backtrace(void *udata, void *pc,
      can drop the whole trace if unwinding stops early. */
   if (msg) {
     moonbit__bt_level = 0;
-    moonbit__eprint(MOONBIT__BT_COLOR("\x1b[31m"));
     moonbit__eprint(msg);
-    moonbit__eprint(MOONBIT__BT_COLOR("\x1b[0m"));
     moonbit__eprint("\n");
   }
 
@@ -1278,11 +1348,8 @@ MOONBIT_EXPORT int moonbit_tcc_backtrace(void *udata, void *pc,
     linebuf[0] = 0;
 
     /* location: either file:line or address */
-    moonbit__bt_buf_append_cstr(linebuf, sizeof linebuf, &len,
-                                MOONBIT__BT_COLOR("\x1b[90m"));
     if (file) {
-      moonbit__bt_buf_append_cstr(linebuf, sizeof linebuf, &len,
-                                  moonbit__basename(file));
+      moonbit__bt_buf_append_cstr(linebuf, sizeof linebuf, &len, file);
       moonbit__bt_buf_append_char(linebuf, sizeof linebuf, &len, ':');
       if (line >= 0)
         moonbit__bt_buf_append_u32_dec(linebuf, sizeof linebuf, &len,
@@ -1293,22 +1360,12 @@ MOONBIT_EXPORT int moonbit_tcc_backtrace(void *udata, void *pc,
       moonbit__bt_buf_append_ptr_hex(linebuf, sizeof linebuf, &len,
                                      (uintptr_t)(const void *)pc);
     }
-    moonbit__bt_buf_append_cstr(linebuf, sizeof linebuf, &len,
-                                MOONBIT__BT_COLOR("\x1b[0m"));
     moonbit__bt_buf_append_char(linebuf, sizeof linebuf, &len, ' ');
 
     moonbit__bt_buf_append_cstr(linebuf, sizeof linebuf, &len,
-                                MOONBIT__BT_COLOR("\x1b[36m"));
-    moonbit__bt_buf_append_cstr(linebuf, sizeof linebuf, &len,
                                 (moonbit__bt_level == 0) ? "at" : "by");
-    moonbit__bt_buf_append_cstr(linebuf, sizeof linebuf, &len,
-                                MOONBIT__BT_COLOR("\x1b[0m"));
     moonbit__bt_buf_append_char(linebuf, sizeof linebuf, &len, ' ');
-    moonbit__bt_buf_append_cstr(linebuf, sizeof linebuf, &len,
-                                MOONBIT__BT_COLOR("\x1b[1m"));
     moonbit__bt_buf_append_cstr(linebuf, sizeof linebuf, &len, func_name);
-    moonbit__bt_buf_append_cstr(linebuf, sizeof linebuf, &len,
-                                MOONBIT__BT_COLOR("\x1b[0m"));
     moonbit__bt_buf_append_cstr(linebuf, sizeof linebuf, &len, "\n");
     moonbit__eprint_n(linebuf, len);
   }
@@ -1382,8 +1439,6 @@ MOONBIT_EXPORT moonbit_string_t moonbit_add_string(moonbit_string_t s1,
   memcpy(result, s1, len1 * 2);
   memcpy(result + len1, s2, len2 * 2);
   result[len1 + len2] = 0;
-  moonbit_decref(s1);
-  moonbit_decref(s2);
   return result;
 }
 
@@ -1782,6 +1837,144 @@ MOONBIT_EXPORT void moonbit_runtime_init(int argc, char **argv) {
 #include <unistd.h>
 #endif
 
+/* Environment variable format notes:
+   - On Unix/POSIX, `environ` is a NULL-terminated array of byte strings in
+     `KEY=VALUE` form. Both key and value are treated as opaque bytes here.
+   - On Windows, `GetEnvironmentStringsA` returns a double-NULL-terminated
+     block of ANSI strings in `KEY=VALUE` form. Entries that start with '=' are
+     pseudo variables (for example `=C:=C:\path`) and are skipped.
+   - This runtime intentionally keeps env keys/values as raw bytes; encoding and
+     decoding are handled at higher layers.
+   - Exported symbol names are namespaced with `moonbit_rt_` to avoid collisions
+     with package-local stubs that may define generic names like `get_env_var`.
+*/
+MOONBIT_EXPORT moonbit_bytes_t moonbit_rt_get_env_var(moonbit_bytes_t key) {
+#ifdef _WIN32
+  DWORD buf_size = GetEnvironmentVariableA((LPCSTR)key, NULL, 0);
+  if (buf_size == 0) {
+    return moonbit_make_bytes(0, 0);
+  }
+  moonbit_bytes_t result = moonbit_make_bytes(buf_size - 1, 0);
+  GetEnvironmentVariableA((LPCSTR)key, (LPSTR)result, buf_size);
+  return result;
+#else
+  char *value = getenv((const char *)key);
+  if (value == NULL) {
+    return moonbit_make_bytes(0, 0);
+  }
+  size_t len = strlen(value);
+  moonbit_bytes_t result = moonbit_make_bytes(len, 0);
+  memcpy(result, value, len);
+  return result;
+#endif
+}
+
+MOONBIT_EXPORT int32_t moonbit_rt_get_env_var_exists(moonbit_bytes_t key) {
+#ifdef _WIN32
+  DWORD buf_size = GetEnvironmentVariableA((LPCSTR)key, NULL, 0);
+  return buf_size != 0;
+#else
+  char *value = getenv((const char *)key);
+  return value != NULL;
+#endif
+}
+
+MOONBIT_EXPORT moonbit_bytes_t *moonbit_rt_get_env_vars(void) {
+#ifdef _WIN32
+  LPCH env_block = GetEnvironmentStringsA();
+  if (env_block == NULL) {
+    return (moonbit_bytes_t *)moonbit_make_ref_array(0, NULL);
+  }
+
+  int count = 0;
+  LPCH env = env_block;
+  while (*env) {
+    char *equals = strchr(env, '=');
+    if (env[0] != '=' && equals != NULL && equals != env) {
+      count++;
+    }
+    env += strlen(env) + 1;
+  }
+
+  moonbit_bytes_t *result =
+      (moonbit_bytes_t *)moonbit_make_ref_array(count * 2, NULL);
+
+  env = env_block;
+  int i = 0;
+  while (*env) {
+    char *equals = strchr(env, '=');
+    if (env[0] != '=' && equals != NULL && equals != env) {
+      size_t key_len = equals - env;
+      size_t val_len = strlen(equals + 1);
+
+      moonbit_bytes_t key_bytes = moonbit_make_bytes(key_len, 0);
+      memcpy(key_bytes, env, key_len);
+
+      moonbit_bytes_t value_bytes = moonbit_make_bytes(val_len, 0);
+      memcpy(value_bytes, equals + 1, val_len);
+
+      result[i * 2] = key_bytes;
+      result[(i * 2) + 1] = value_bytes;
+      i++;
+    }
+    env += strlen(env) + 1;
+  }
+
+  FreeEnvironmentStringsA(env_block);
+  return result;
+#else
+  extern char **environ;
+
+  int count = 0;
+  char **env = environ;
+  while (*env != NULL) {
+    count++;
+    env++;
+  }
+
+  moonbit_bytes_t *result =
+      (moonbit_bytes_t *)moonbit_make_ref_array(count * 2, NULL);
+  env = environ;
+  int i = 0;
+  while (*env != NULL) {
+    char *equals = strchr(*env, '=');
+    if (equals != NULL) {
+      size_t key_len = equals - *env;
+      size_t val_len = strlen(equals + 1);
+
+      moonbit_bytes_t key_bytes = moonbit_make_bytes(key_len, 0);
+      memcpy(key_bytes, *env, key_len);
+
+      moonbit_bytes_t value_bytes = moonbit_make_bytes(val_len, 0);
+      memcpy(value_bytes, equals + 1, val_len);
+
+      result[i * 2] = key_bytes;
+      result[(i * 2) + 1] = value_bytes;
+    }
+    env++;
+    i++;
+  }
+  return result;
+#endif
+}
+
+MOONBIT_EXPORT void moonbit_rt_set_env_var(moonbit_bytes_t key,
+                                           moonbit_bytes_t value) {
+#ifdef _WIN32
+  SetEnvironmentVariableA((LPCSTR)key, (LPCSTR)value);
+#else
+  setenv((const char *)key, (const char *)value, 1);
+#endif
+}
+
+MOONBIT_EXPORT void moonbit_rt_unset_env_var(moonbit_bytes_t key) {
+#ifdef _WIN32
+  SetEnvironmentVariableA((LPCSTR)key, NULL);
+#else
+  unsetenv((const char *)key);
+#endif
+}
+
 MOONBIT_EXPORT FILE *moonbit_fopen_ffi(moonbit_bytes_t path,
                                        moonbit_bytes_t mode) {
   return fopen((const char *)path, (const char *)mode);
@@ -2021,6 +2214,15 @@ MOONBIT_EXPORT double moonbit_monotonic_clock_stop(void *prev) {
          freq.QuadPart;
 }
 
+MOONBIT_FFI_EXPORT
+uint64_t moonbit_get_ms_since_epoch() {
+  FILETIME file_time;
+  GetSystemTimeAsFileTime(&file_time);
+  uint64_t result = (uint64_t)file_time.dwHighDateTime << 32;
+  result |= file_time.dwLowDateTime;
+  return result / 10000 - 11644473600000;
+}
+
 #else
 
 struct timestamp {
@@ -2043,6 +2245,13 @@ MOONBIT_EXPORT double moonbit_monotonic_clock_stop(void *prev) {
   struct timespec *ts0 = &(((struct timestamp *)prev)->ts);
   return (double)((ts.tv_sec - ts0->tv_sec) * 1000000) +
          (double)(ts.tv_nsec - ts0->tv_nsec) / 1000.0;
+}
+
+MOONBIT_FFI_EXPORT
+uint64_t moonbit_get_ms_since_epoch() {
+  struct timeval tv;
+  gettimeofday(&tv, 0);
+  return tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
 #endif
