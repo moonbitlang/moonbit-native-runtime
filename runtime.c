@@ -2210,8 +2210,8 @@ MOONBIT_EXPORT double moonbit_monotonic_clock_stop(void *prev) {
     (void)QueryPerformanceFrequency(&freq);
 
   struct timestamp *ts = (struct timestamp *)prev;
-  return (double)((counter.QuadPart - ts->ts.QuadPart) * 1000000) /
-         freq.QuadPart;
+  return (double)(counter.QuadPart - ts->ts.QuadPart) /
+         (double)freq.QuadPart * 1e6;
 }
 
 MOONBIT_FFI_EXPORT
@@ -2243,8 +2243,8 @@ MOONBIT_EXPORT double moonbit_monotonic_clock_stop(void *prev) {
   if (0 != clock_gettime(MOONBIT_CLOCK_MONOTONIC, &ts))
     return NAN;
   struct timespec *ts0 = &(((struct timestamp *)prev)->ts);
-  return (double)((ts.tv_sec - ts0->tv_sec) * 1000000) +
-         (double)(ts.tv_nsec - ts0->tv_nsec) / 1000.0;
+  return (double)(ts.tv_sec - ts0->tv_sec) * 1000000 +
+         (double)(ts.tv_nsec - ts0->tv_nsec) * 0.001;
 }
 
 MOONBIT_FFI_EXPORT
