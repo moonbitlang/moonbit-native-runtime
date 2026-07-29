@@ -18,12 +18,21 @@
 extern "C" {
 #endif
 
+#ifdef _WIN32
+#ifndef _CRT_RAND_S
+#define _CRT_RAND_S
+#endif
+#endif
+
 #define MOONBIT_BUILD_RUNTIME
 #include "moonbit.h"
+#include "moonbit_simd.h"
 
 #ifdef _MSC_VER
 #define _Noreturn __declspec(noreturn)
 #endif
+
+MOONBIT_EXPORT _Noreturn void moonbit_panic(void);
 
 #ifdef MOONBIT_NATIVE_NO_SYS_HEADER
 
@@ -61,238 +70,474 @@ _Noreturn void abort(void);
 #include <mach-o/dyld.h>
 #endif // #if defined(__APPLE__)
 
-// Set maximum number of backtrace frames to print.
-#define BACKTRACE_LIMIT 15
-
 #endif // #if defined(MOONBIT_ALLOW_STACKTRACE) && !defined(__TINYC__)
 
 #endif
 
-// header manipulation macros
-#define Moonbit_header_ptr_field_offset(header)                                \
-  ((header >> 19) & (((uint32_t)1 << 11) - 1))
+// Set maximum number of backtrace frames to print.
+#define BACKTRACE_LIMIT 15
 
-#define Moonbit_header_ptr_field_count(header)                                 \
-  ((header >> 8) & (((uint32_t)1 << 11) - 1))
-
-#define Moonbit_object_ptr_field_offset(obj)                                   \
-  (Moonbit_header_ptr_field_offset(Moonbit_object_header(obj)->meta))
-
-#define Moonbit_object_ptr_field_count(obj)                                    \
-  (Moonbit_header_ptr_field_count(Moonbit_object_header(obj)->meta))
+// Forward declaration
+static const char *demangle(const char *func_name, char **owned_out);
 
 MOONBIT_EXPORT void *libc_malloc(size_t size) { return malloc(size); }
 MOONBIT_EXPORT void libc_free(void *ptr) { free(ptr); }
 
+// Static GC layout metadata. Regular object headers store a 22-bit word offset
+// into this flattened table. Each layout has variable length:
+//
+//   word 0: payload size in 4-byte words, excluding the object header
+//   word 1: number of following reference offsets
+//   word 2+: reference-start offsets in 4-byte payload words
+MOONBIT_EXPORT const uint32_t *moonbit_layout_table = 0;
+
 MOONBIT_EXPORT void *moonbit_malloc(size_t size) {
   struct moonbit_object *ptr =
       (struct moonbit_object *)malloc(sizeof(struct moonbit_object) + size);
-  ptr->rc = 1;
+  Moonbit_init_dynamic_rc(ptr, moonbit_BLOCK_KIND_REGULAR);
   return ptr + 1;
 }
 
 #define moonbit_free(obj) free(Moonbit_object_header(obj))
 
-MOONBIT_EXPORT void moonbit_drop_object(void *obj) {
-  /* `moonbit_drop_object`:
+// The low five RC bits store the block kind and cycle-collection bookkeeping,
+// so changing the logical reference count by one changes the raw word by 32.
+// Runtime hot paths can compare the raw word directly and avoid decoding the
+// signed 27-bit count:
+//
+//   logical count 0: raw rc in [0, 31]
+//   logical count 1: raw rc in [32, 63]
+//   logical count 2+: raw rc >= 64
+//   static/immortal: raw rc is negative
+//
+// These predicates intentionally use signed comparisons for the dynamic/shared
+// thresholds so static/immortal objects are excluded without shifting.
+#define MOONBIT_RC_COUNT_UNIT ((int32_t)(1u << MOONBIT_RC_COUNT_SHIFT))
+#define raw_rc_is_dynamic(rc) ((int32_t)(rc) >= MOONBIT_RC_COUNT_UNIT)
+#define raw_rc_is_shared(rc) ((int32_t)(rc) >= (MOONBIT_RC_COUNT_UNIT * 2))
 
-     - perform `decref` on all children of `obj`
-       - recursively drop children whose count dropped to zero
-     - free the memory occupied by `obj`
+#define MOONBIT_EXTERNAL_PAYLOAD_SIZE_MASK (((uint32_t)1 << 30) - 1)
 
-     We want to avoid stackoverflow when dropping a deep object.
-     Here's an algorithm with O(1) stack requirement and zero heap allocation.
-     Traversing the object graph itself requires `O(d)` space (depth of object),
-     but since we are dropping objects,
-     we can *reuse the memory of to-be-dropped objects* to store traversal
-     state.
+// Moonbit_header_layout_class is defined in moonbit.h so the value-enum retain
+// fast path can be inlined from runtime_core.c.
 
-     Everytime we dive down into a child, we need to remember the following
-     states:
+#define Moonbit_header_layout_index(header)                                    \
+  (((header) >> MOONBIT_REGULAR_LAYOUT_INDEX_SHIFT) &                         \
+   MOONBIT_REGULAR_LAYOUT_INDEX_MASK)
 
-     - our position in the middle of current object (`int32_t`)
-     - how many objects remaining in current object (`int32_t`)
-     - the parent of current object (`void*`)
+#define Moonbit_header_layout(header)                                          \
+  (&moonbit_layout_table[Moonbit_header_layout_index(header)])
 
-     Fortunately, we have exactly the space required in to-be-dropped current
-     object:
+// An indexed layout entry is [size_in_word; child_count; tagged_child...].
+// [child_count] is the number of tagged children (static refs + embedded value
+// enums combined). The i-th tagged child is [(payload_word_offset << 1) |
+// is_venum].
+#define Moonbit_header_child_count(header)                                      \
+  (Moonbit_header_layout(header)[1])
 
-     - current position is stored in the `(struct moonbit_object).rc` field
-     - remaining children count is stored in the `(struct moonbit_object).meta`
-     field
-     - parent is stored in the place where current visited object was previously
-     stored
+#define Moonbit_header_child_tagged(header, i)                                  \
+  (Moonbit_header_layout(header)[2 + (i)])
 
-     The control flow of the algorithm is quite complex,
-     here it is represented as three big goto-blocks:
+#define Moonbit_make_external_object_header(payload_size)                      \
+  (((uint32_t)MOONBIT_REGULAR_LAYOUT_CLASS_EXTERNAL                           \
+    << MOONBIT_REGULAR_LAYOUT_CLASS_SHIFT) |                                  \
+   ((uint32_t)(payload_size) & MOONBIT_EXTERNAL_PAYLOAD_SIZE_MASK))
 
-     - `handle_new_object`: drop a new object not visited previously
+static void **ref_slot_at(uint32_t layout_meta, void *value, int32_t ref_index) {
+  int32_t offset_in_word =
+      (int32_t)(Moonbit_header_child_tagged(layout_meta, ref_index) >> 1);
+  return (void **)((uint32_t *)value + offset_in_word);
+}
 
-     - `back_to_parent`: we have finished processing current object,
-       move back to its parent and process remaining children of its parent
 
-     - `process_children`: perform `decref` on the children of current object,
-       resuming from a position in the middle
-  */
+/* ===========================================
+   The drop object algorithm
 
-  /* States maintained in the algorithm:
+   When dropping a object, we need to recursively `decref` its reference children,
+   which may trigger a recursive drop object operation if the RC become zero.
+   So it is possible that a very large object may be dropped within a single `drop_object` call.
+   We need to ensure stack safety even in case of arbitrarily deep object.
+   The `drop_object` algorithm here is `O(1)` stack space + zero heap allocation.
+   It achieves this by reusing corpse of parent object as a worklist for to-be-processed children.
 
-     - `obj`: the object currently being processed
-     - `parent`: the parent of `obj`, `0` if `obj` is the root
-     - `curr_child_offset`: the offset of the first unprocessed child in `obj`,
-       counted in `uint32_t`, starting from `obj`
-     - `remaining_children_count`: the number of unprocessed child in `obj`
+   The whole `drop_object` procedure operate in a DFS manner,
+   The `drop_object` procedure maintains a global linked array list of `struct drop_object_worklist` below.
+   Each node in the list is a parent object being dropped,
+   within the node holds to-be-processed children within that parent
+   (note that children stored in the worklist may not necessarily need dropping,
+    we perform the RC check when popping objects out of the worklist).
+   The memory of each node come from the very parent object it represents.
 
-     `curr_child_offset` and `remaining_children_count`, are used by
-     `process_children`. So they must be valid before entering
-     `process_children`
-  */
-  void *parent = 0;
-  int32_t curr_child_offset, remaining_children_count;
-handle_new_object:
-  /* If current object has any children, jump to `process_children`,
-     otherwise, we have finished processing current object, fallthrough to
-     `back_to_parent`.
-  */
-  switch (Moonbit_object_kind(obj)) {
-  case moonbit_BLOCK_KIND_REGULAR: {
-    const int32_t ptr_field_offset = Moonbit_object_ptr_field_offset(obj);
-    const int32_t n_ptr_fields = Moonbit_object_ptr_field_count(obj);
-    if (n_ptr_fields > 0) {
-      curr_child_offset = ptr_field_offset;
-      remaining_children_count = n_ptr_fields;
-      goto process_children;
+   The worklist node need two `int32_t` plus one pointer for metadata.
+   The object header give us the two `int32_t`,
+   but we still need to find space for the next node pointer from the payload.
+   A parent object may contain exactly `n` reference children,
+   in this case, we have no room for storing the next pointer of the worklist.
+   The trick here is to delay the initialization of next pointer
+   until we encounter the first child in the parent to drop recursively.
+   As we descend into that child, the first slot in the parent is guaranteed to be useless,
+   so we can safely store the next pointer there.
+ * =========================================== */
+
+struct drop_object_worklist {
+  // To obtain a natural drop order, we free children from left to right,
+  // hence two `int32_t` values are needed.
+  int32_t index; // this correspond to the RC field in the original object
+  int32_t count; // this correspond to the meta field in the original object
+
+  union {
+    struct drop_object_worklist *next;
+    void *data[1]; // Children to process in the worklist
+  };
+};
+
+static inline
+uint32_t scan_regular_object(
+  void *obj,
+  uint32_t const *layout,
+  struct drop_object_worklist *wl_node,
+  uint32_t count
+);
+
+/* Scan the object starting at address `obj`, whose layout is described by `layout`,
+   and append all pointer children of `obj` into `wl_node`.
+   The current number of children in `wl_node` should be passed in `count`.
+
+   Return the total number of nodes in `wl_node` after writing references in `obj`.
+
+   Note that in practice `obj` is probably part of `wl_node`,
+   but it is guaranteed that the used part in `wl_node` never overlap with `obj`. */
+static inline
+uint32_t scan_regular_object(
+  void *obj,
+  uint32_t const *layout,
+  struct drop_object_worklist *wl_node,
+  uint32_t count
+) {
+  uint32_t child_count = layout[1];
+  for (uint32_t i = 0; i < child_count; ++i) {
+    uint32_t ref_field_desc = layout[i + 2];
+    uint32_t *obj_start = (uint32_t*)obj + (ref_field_desc >> 1);
+    if (ref_field_desc & 1u) {
+      // value enum
+      uint32_t const venum_header = *obj_start;
+      // A value enum may contain reference field only in some of its constructors,
+      // so it is possible that we will encounter a all-scalar constructor here.
+      // In that case, there will be no meaningful layout index in the header,
+      // so we need to test the layout class first.
+      if (Moonbit_header_layout_class(venum_header) == MOONBIT_REGULAR_LAYOUT_CLASS_INDEXED) {
+        uint32_t const *layout = Moonbit_header_layout(venum_header);
+        count = scan_regular_object(obj_start, layout, wl_node, count);
+      }
+    } else {
+      // normal reference, store in `wl_node`
+      void *child = *(void**)obj_start;
+      wl_node->data[count] = child;
+      ++count;
     }
-    break;
   }
-  case moonbit_BLOCK_KIND_REF_ARRAY: {
-    int32_t len = Moonbit_array_length(obj);
-    const int32_t elem_size = Moonbit_array_elem_size_shift(obj);
-    if (len > 0) {
-      if (elem_size == moonbit_REF_ARRAY_REF_VALTYPE) {
-        // mixed value type array
-        uint32_t valtype_header = Moonbit_valtype_header(obj)->elem_header;
-        const int32_t ptr_field_offset =
-            Moonbit_header_ptr_field_offset(valtype_header);
-        const int32_t n_ptr_fields =
-            Moonbit_header_ptr_field_count(valtype_header);
-        void *cur_elem = obj;
-        void **ptrs;
-        for (int32_t i = 0; i < len; ++i) {
-          ptrs = (void **)((uint32_t *)cur_elem + ptr_field_offset);
-          for (int32_t j = 0; j < n_ptr_fields; ++j) {
-            if (ptrs[j])
-              moonbit_decref(ptrs[j]);
+  return count;
+}
+
+MOONBIT_EXPORT void moonbit_drop_object(void *obj) {
+  // The root of worklist, holding remaining objects to drop.
+  struct drop_object_worklist *wl_root = 0;
+  // The current worklist node being processed.
+  // `wl_node` may be either `wl_root`, or a fresh new node not yet linked.
+  struct drop_object_worklist *wl_node = 0;
+  uint32_t meta;
+
+process_new_object:
+    /* The `process_new_object` block:
+
+       1. Analyze and scan a new object to drop in `obj`
+
+       2. If `obj` have any reference child,
+          `process_new_object` should compact the layout of `obj`,
+          and store all reference children using the layout of `wl_node`.
+          After that, `process_new_object` will jump to `find_next_object`,
+          to find a new child in `obj` to recursively drop.
+
+          Note than in this case, `wl_node` will not be linked to `wl_root`.
+          Because there is no room for `wl_node->next` before we process its content.
+
+       3. If `obj` does not contain any reference child,
+          `process_new_object` should jump to `back_to_parent` directly.
+    */
+    wl_node = (struct drop_object_worklist*)Moonbit_object_header(obj);
+    meta = ((struct moonbit_object*)wl_node)->meta;
+    switch (Moonbit_object_kind(obj)) {
+      case moonbit_BLOCK_KIND_REGULAR: {
+        switch (Moonbit_header_layout_class(meta)) {
+          case MOONBIT_REGULAR_LAYOUT_CLASS_SCALAR:
+            goto back_to_parent;
+          case MOONBIT_REGULAR_LAYOUT_CLASS_EXTERNAL: {
+            int32_t const payload_size = meta & MOONBIT_EXTERNAL_PAYLOAD_SIZE_MASK;
+            void (**addr_of_finalize)(void *) =
+                (void (**)(void *))((uint8_t *)obj + payload_size);
+            (**addr_of_finalize)(obj);
+            goto back_to_parent;
           }
-          cur_elem = &ptrs[n_ptr_fields];
+          case MOONBIT_REGULAR_LAYOUT_CLASS_INDEXED: {
+            uint32_t const *layout = Moonbit_header_layout(meta);
+            if (layout[0] << 2 == layout[1] * sizeof(void*)) {
+              // fast path: all children are simple reference,
+              // the layout is already compatible with `wl_node`,
+              // no need to compact the layout
+              wl_node->index = 0;
+              wl_node->count = layout[1];
+            } else {
+              wl_node->index = 0;
+              wl_node->count = scan_regular_object(obj, layout, wl_node, 0);
+            }
+            goto find_next_object;
+          }
         }
-        // The array of ref value type will be freed.
-        // We move the pointer backward for the size of the value type header.
-        // So that the regular free logic can be used.
-        obj = (uint64_t *)obj - 1;
-      } else {
-        // regular array
-        curr_child_offset = 0;
-        remaining_children_count = len;
-        goto process_children;
+        break;
+      }
+
+      case moonbit_BLOCK_KIND_VAL_ARRAY: goto back_to_parent;
+      case moonbit_BLOCK_KIND_REF_ARRAY: {
+        // The layout of reference array is compatible with `wl_node`,
+        // so no need to do any compaction here.
+        wl_node->index = 0;
+        wl_node->count = meta;
+        goto find_next_object;
+      }
+
+      case moonbit_BLOCK_KIND_REF_VALTYPE_ARRAY: {
+        struct moonbit_valtype_array_header *varray_header = Moonbit_valtype_header(obj);
+        // valtype array has a longer prefix,
+        // so we need to adjust the worklist node accordingly
+        wl_node = (struct drop_object_worklist*)varray_header;
+        uint32_t const *elem_layout = Moonbit_header_layout(varray_header->elem_header);
+        wl_node->index = 0;
+        uint32_t const elem_size = elem_layout[0];
+        uint32_t count = 0;
+        for (uint32_t i = 0; i < meta; ++i) {
+          uint32_t *elem_start = (uint32_t*)obj + i * elem_size;
+          count = scan_regular_object(elem_start, elem_layout, wl_node, count);
+        }
+        wl_node->count = count;
+        goto find_next_object;
       }
     }
-    break;
-  }
-  case moonbit_BLOCK_KIND_VAL_ARRAY:
-    break;
-  case moonbit_BLOCK_KIND_EXTERNAL: {
-    int32_t payload_size = Moonbit_object_header(obj)->meta & ((1 << 30) - 1);
-    void (**addr_of_finalize)(void *) =
-        (void (**)(void *))((uint8_t *)obj + payload_size);
-    (**addr_of_finalize)(obj);
-    break;
-  }
-  }
 
 back_to_parent:
-  moonbit_free(obj);
-  if (!parent)
+  /* The `back_to_parent` block should be executed when current `wl_node` is completely processed.
+     `back_to_parent` free this node and fetch a new node from the global `wl_root` list.
+   */
+  free(wl_node);
+  if (!wl_root)
+    // Everything dropped, no more work to do
     return;
 
-  // Recover stored traversal state from the memory of parent
-  curr_child_offset = Moonbit_object_header(parent)->rc;
-  remaining_children_count = Moonbit_object_header(parent)->meta;
-  obj = parent;
-  parent = *(void **)((uint32_t *)parent + curr_child_offset);
-  // We have finished processing one object, so move forward by one slot
-  curr_child_offset += sizeof(void *) >> 2;
-  // Fallthrough to `process_children`, resuming handling of parent
+  /* Note that we does not remove the new node from `wl_root` here,
+     because in case we find a new child to drop below in `find_next_object`,
+     `wl_node` should be pushed into `wl_root` again, and this pop-and-push is unnecessary.
+     We only pop nodes from `wl_root` when a node is completely processed. */
+  wl_node = wl_root;
 
-process_children:
-  // `curr_child_offset` and `remaining_children_count` must be properly set
-  // here.
-  while (remaining_children_count > 0) {
-    void *next = *(void **)((uint32_t *)obj + curr_child_offset);
-    remaining_children_count -= 1;
-    if (next) {
-      struct moonbit_object *header = Moonbit_object_header(next);
-      int32_t const count = header->rc;
-      if (count > 1) {
-        // This child is still alive, continue with remaining children
-        header->rc = count - 1;
-      } else if (count == 1) {
-        /* This child should be recursively dropped.
-           Before diving into the child, store current traveral state in `obj`
-        */
-        if (remaining_children_count == 0) {
-          /* "tail call" optimization: if we are diving into the last child,
-             there is no need to process current object when we go back,
-             because we know current object has no more children.
-             So we can:
+find_next_object:
+  /* The `find_next_object` block tries to find the next object to drop recursively
+     from current `wl_node`. If a object is found, it will jump to `process_new_object`.
+     If no object is found in current `wl_node`,
+     `wl_node` will be dropped and removed from the worklist.
 
-             - free current object immediately
-             - don't touch `parent`, so it is still parent of `obj`.
-               This way, when we go back from `next`,
-               we would jump to `parent` directly, skipping `obj`
+     Note that `wl_node` may or may not be `wl_root` when `find_next_object` is executed.
+     If the control flow come from `back_to_parent`, `wl_node` will be `wl_root.
+     If the control flow come from `process_new_object`,
+     `wl_node` will be a fresh node not yet linked to `wl_root`.
+   */
+  for (uint32_t i = wl_node->index, count = wl_node->count; i < count; ++i) {
+    obj = wl_node->data[i];
+    if (!obj)
+      continue;
 
-             This optimization can save a complete iteration of the object graph
-             when dropping structures like linked list.
-          */
-          moonbit_free(obj);
-        } else {
-          Moonbit_object_header(obj)->rc = curr_child_offset;
-          Moonbit_object_header(obj)->meta = remaining_children_count;
-          *(void **)((uint32_t *)obj + curr_child_offset) = parent;
-          parent = obj;
-        }
-        obj = next;
-        goto handle_new_object;
+    struct moonbit_object *header = Moonbit_object_header(obj);
+    int32_t const rc = header->rc;
+    if (raw_rc_is_shared(rc)) {
+      // This child is still alive, decrease the count and
+      // continue with remaining reference children
+      header->rc = rc - MOONBIT_RC_COUNT_UNIT;
+      continue;
+    }
+
+    if (!raw_rc_is_dynamic(rc))
+      // static object
+      continue;
+
+    // we have found a object to drop recursively
+    ++i;
+    if (i == count) {
+      // last child in parent, no longer need to keep parent in the worklist
+      if (wl_node == wl_root)
+        wl_root = wl_node->next;
+      free(wl_node);
+    } else {
+      wl_node->index = i;
+      if (wl_node != wl_root) {
+        // `wl_node` come from a new object, link it to the worklist.
+        // Note that the first object in `wl_node->data` must have been traversed now,
+        // so we can safely store the next pointer in `wl_node->next`,
+        // which is an alias to `wl_node->data[0]`.
+        wl_node->next = wl_root;
+        wl_root = wl_node;
       }
     }
-    curr_child_offset += sizeof(void *) >> 2;
+    goto process_new_object;
   }
-  // `remaining_children_count = 0`, all children processed
+
+  // No more object to process in `wl_node`, drop it now.
+  if (wl_node == wl_root)
+    wl_root = wl_node->next;
+
   goto back_to_parent;
 }
 
 MOONBIT_EXPORT void moonbit_incref(void *ptr) {
   struct moonbit_object *header = Moonbit_object_header(ptr);
-  int32_t const count = header->rc;
-  if (count > 0) {
-    header->rc = count + 1;
+  int32_t const rc = header->rc;
+  if (raw_rc_is_dynamic(rc)) {
+    Moonbit_increase_rc_count(header);
   }
 }
 
 MOONBIT_EXPORT void moonbit_decref(void *ptr) {
   struct moonbit_object *header = Moonbit_object_header(ptr);
-  int32_t const count = header->rc;
-  if (count > 1) {
-    header->rc = count - 1;
-  } else if (count == 1) {
+  int32_t const rc = header->rc;
+  if (raw_rc_is_shared(rc)) {
+    header->rc = rc - MOONBIT_RC_COUNT_UNIT;
+  } else if (raw_rc_is_dynamic(rc)) {
     moonbit_drop_object(ptr);
   }
 }
 
-#if defined(MOONBIT_ALLOW_STACKTRACE) && !defined(__TINYC__)
+// A value enum's first word is a self-describing object header (the active
+// constructor's layout), and its payload begins after the tag and size words
+// (8 bytes). The constructor layout's reference offsets are payload-relative
+// words, so a SCALAR header means "no references" and an INDEXED header lists
+// exactly the references live for the current tag. A null reference slot is
+// skipped so nullable references are safe.
+//
+// Two subtleties of the helpers below:
+//
+//   - They are emitted only for value enums whose type carries references, but a
+//     value can currently hold a scalar constructor -- e.g. `A` or `B(Int)` of
+//     `enum E { A; B(Int); C(String) }`. Such a value has a SCALAR header whose
+//     layout_index is a dummy 0, so the `!= INDEXED` early return is required,
+//     not just a fast path: it both skips the no-reference case and avoids
+//     indexing moonbit_layout_table with that dummy index.
+//
+//   - Each live slot holds a plain heap reference, so moonbit_incref/decref is
+//     the correct operation. This relies on value enums not nesting: a payload
+//     field cannot itself be an inline value enum (unsupported for now). If
+//     nesting is added, such a slot would instead need a recursive
+//     moonbit_incref/decref_value_enum.
+
+// Adjust the rc of the references of a value enum [value] that fills [len] array
+// slots, mirroring moonbit_update_ref_valtype_rc but dispatching on the value
+// enum's own (tag-dependent) header. len==0 undoes the init's references;
+// len>1 adds (len-1) to each so all copies share ownership.
+MOONBIT_EXPORT void moonbit_update_ref_enum_valtype_rc(int32_t len, void *value) {
+  uint32_t header = *(uint32_t *)value;
+  if (Moonbit_header_layout_class(header) != MOONBIT_REGULAR_LAYOUT_CLASS_INDEXED) {
+    return;
+  }
+  uint32_t *payload =
+      (uint32_t *)((char *)value );
+  uint32_t n = Moonbit_header_child_count(header);
+  if (len == 0) {
+    for (uint32_t i = 0; i < n; ++i) {
+      void *r = *(void **)(payload + (Moonbit_header_child_tagged(header, i) >> 1));
+      if (r) {
+        moonbit_decref(r);
+      }
+    }
+  } else if (len > 1) {
+    for (uint32_t i = 0; i < n; ++i) {
+      void *r = *(void **)(payload + (Moonbit_header_child_tagged(header, i) >> 1));
+      if (r) {
+        struct moonbit_object *value_header = Moonbit_object_header(r);
+        const int32_t count = Moonbit_rc_count(value_header);
+        if (count > 0) {
+          Moonbit_set_rc_count(value_header,
+                               (uint32_t)count + (uint32_t)len - 1u);
+        }
+      }
+    }
+  }
+}
+
+// Slow path: walk the current variant's reference slots. Assumes the header is
+// INDEXED (the callers inline that cheap check). Kept out of line so scalar-tag
+// moves stay call-free once the check is inlined at the use site.
+MOONBIT_EXPORT void moonbit_incref_value_enum_loop(void *p) {
+  uint32_t header = *(uint32_t *)p;
+  uint32_t *payload =
+      (uint32_t *)((char *)p );
+  uint32_t n = Moonbit_header_child_count(header);
+  for (uint32_t i = 0; i < n; i++) {
+    void *r = *(void **)(payload + (Moonbit_header_child_tagged(header, i) >> 1));
+    if (r) {
+      // `r` is a plain heap reference, not a nested inline value enum (value
+      // enums don't nest yet), so a direct moonbit_incref is correct.
+      moonbit_incref(r);
+    }
+  }
+}
+
+MOONBIT_EXPORT void moonbit_incref_value_enum(void *p) {
+  if (Moonbit_header_layout_class(*(uint32_t *)p) ==
+      MOONBIT_REGULAR_LAYOUT_CLASS_INDEXED) {
+    moonbit_incref_value_enum_loop(p);
+  }
+}
+
+MOONBIT_EXPORT void moonbit_decref_value_enum_loop(void *p) {
+  uint32_t header = *(uint32_t *)p;
+  uint32_t *payload =
+      (uint32_t *)((char *)p );
+  uint32_t n = Moonbit_header_child_count(header);
+  for (uint32_t i = 0; i < n; i++) {
+    void *r = *(void **)(payload + (Moonbit_header_child_tagged(header, i) >> 1));
+    if (r) {
+      // `r` is a plain heap reference, not a nested inline value enum (value
+      // enums don't nest yet), so a direct moonbit_decref is correct.
+      moonbit_decref(r);
+    }
+  }
+}
+
+MOONBIT_EXPORT void moonbit_decref_value_enum(void *p) {
+  if (Moonbit_header_layout_class(*(uint32_t *)p) ==
+      MOONBIT_REGULAR_LAYOUT_CLASS_INDEXED) {
+    moonbit_decref_value_enum_loop(p);
+  }
+}
+
+
+#ifdef _WIN32
+
+#include <windows.h>
+
+#ifdef _MSC_VER
+
+#include <shellapi.h>
+#include <dbghelp.h>
+#include <bcrypt.h>
+
+#pragma comment(lib, "Kernel32.lib")
+#pragma comment(lib, "DbgHelp.lib")
+#pragma comment(lib, "Shell32.lib")
+#pragma comment(lib, "Bcrypt.lib")
+
+#endif
+
+// #ifdef _WIN32
+#elif defined(MOONBIT_ALLOW_STACKTRACE) && !defined(__TINYC__)
 
 // Forward declaration
-static const char *demangle(const char *func_name, char **owned_out);
 static void error_callback(void *data, const char *msg, int errnum);
 
 typedef struct {
@@ -372,7 +617,59 @@ static void error_callback(void *data, const char *msg, int errnum) {
 #endif // #if defined(MOONBIT_ALLOW_STACKTRACE) && !defined(__TINYC__)
 
 MOONBIT_EXPORT _Noreturn void moonbit_panic(void) {
-#if defined(MOONBIT_ALLOW_STACKTRACE) && !defined(__TINYC__)
+#ifdef _MSC_VER
+  fflush(stdout);
+  fprintf(stderr, "PanicError\n");
+
+  SymSetOptions(SYMOPT_LOAD_LINES);
+
+  void *frames[BACKTRACE_LIMIT];
+  int n = CaptureStackBackTrace(0, BACKTRACE_LIMIT, frames, NULL);
+  HANDLE self = GetCurrentProcess();
+  if (!SymInitialize(self, NULL, TRUE))
+    goto fail_to_get_stack_trace;
+
+  for (int i = 0; i < n; ++i) {
+    void *frame = frames[i];
+    SYMBOL_INFO *symbol = malloc(sizeof(SYMBOL_INFO) + 256);
+    symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+    symbol->MaxNameLen = 255;
+    if (!SymFromAddr(self, (DWORD64)frame, NULL, symbol)) {
+      fprintf(stderr, "    at ??? (%lld)\n", (uint64_t)frame);
+      continue;
+    }
+    char *demangled_name = NULL;
+    const char *func_name = demangle(symbol->Name, &demangled_name);
+
+    DWORD displacement;
+#ifdef _WIN64
+    IMAGEHLP_LINE64 line;
+    line.SizeOfStruct = sizeof(IMAGEHLP_LINE64);
+    BOOL ret = SymGetLineFromAddr64(self, (DWORD64)frame, &displacement, &line);
+#else
+    IMAGEHLP_LINE line;
+    line.SizeOfStruct = sizeof(IMAGEHLP_LINE);
+    BOOL ret = SymGetLineFromAddr(self, (DWORD)frame, &displacement, &line);
+#endif
+    if (ret) {
+      fprintf(stderr, "    at %s (%s:%d)\n", func_name, line.FileName, line.LineNumber);
+    } else {
+      fprintf(stderr, "    at %s\n", func_name);
+    }
+
+    if (demangled_name)
+      free(demangled_name);
+
+    if (strncmp(symbol->Name, "main", 4) == 0)
+      break;
+  }
+
+  if (n == BACKTRACE_LIMIT)
+    fprintf(stderr, "    ...\n");
+
+fail_to_get_stack_trace:
+// #ifdef _MSC_VER
+#elif defined(MOONBIT_ALLOW_STACKTRACE) && !defined(__TINYC__)
   fflush(stdout);
   fprintf(stderr, "PanicError\n");
 
@@ -936,6 +1233,7 @@ static int mbt_parse_type_arg(const char **p, mbt_str *out) {
     case 'u': (*p)++; return mbt_str_append_cstr(out, "Unit");
     case 'y': (*p)++; return mbt_str_append_cstr(out, "Byte");
     case 'z': (*p)++; return mbt_str_append_cstr(out, "Bytes");
+    case 'v': (*p)++; return mbt_str_append_cstr(out, "V128");
     case 'A': {
       (*p)++;
       if (!mbt_str_append_cstr(out, "FixedArray["))
@@ -1381,11 +1679,13 @@ MOONBIT_EXPORT int moonbit_tcc_backtrace(void *udata, void *pc,
 
 MOONBIT_EXPORT void *moonbit_malloc_array(enum moonbit_block_kind kind,
                                           int elem_size_shift, int32_t len) {
+  if (len < 0)
+    moonbit_panic();
   int padding = elem_size_shift < 2 ? 1 : 0;
   struct moonbit_object *obj = (struct moonbit_object *)malloc(
       ((len + padding) << elem_size_shift) + sizeof(struct moonbit_object));
-  obj->rc = 1;
-  obj->meta = Moonbit_make_array_header(kind, elem_size_shift, len);
+  Moonbit_init_dynamic_rc(obj, kind);
+  Moonbit_set_meta(obj, (uint32_t)len);
   return obj + 1;
 }
 
@@ -1420,12 +1720,12 @@ MOONBIT_EXPORT moonbit_string_t moonbit_make_string(int32_t len,
   return str;
 }
 
-MOONBIT_EXPORT int moonbit_val_array_equal(const void *lhs, const void *rhs) {
+MOONBIT_EXPORT int moonbit_val_array_equal_sized(const void *lhs,
+                                                 const void *rhs,
+                                                 int32_t elem_size) {
   int32_t const len = Moonbit_array_length(lhs);
   if (len != Moonbit_array_length(rhs))
     return 0;
-
-  int32_t const elem_size = 1 << Moonbit_array_elem_size_shift(lhs);
 
   return 0 == memcmp(lhs, rhs, len * elem_size);
 }
@@ -1450,6 +1750,323 @@ MOONBIT_EXPORT moonbit_bytes_t moonbit_make_bytes(int32_t size, int init) {
   return result;
 }
 
+static int32_t moonbit__utf8_decode_scalar_one(const uint8_t *src,
+                                               int32_t len, uint32_t *out) {
+  uint8_t b0;
+  uint8_t b1;
+  uint8_t b2;
+  uint8_t b3;
+
+  if (len <= 0)
+    return -1;
+  b0 = src[0];
+  if (b0 < 0x80) {
+    *out = b0;
+    return 1;
+  }
+  if (b0 < 0xC2)
+    return -1;
+  if (b0 < 0xE0) {
+    if (len < 2)
+      return -1;
+    b1 = src[1];
+    if ((b1 & 0xC0) != 0x80)
+      return -1;
+    *out = ((uint32_t)(b0 & 0x1F) << 6) | (uint32_t)(b1 & 0x3F);
+    return 2;
+  }
+  if (b0 < 0xF0) {
+    if (len < 3)
+      return -1;
+    b1 = src[1];
+    b2 = src[2];
+    if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80)
+      return -1;
+    if (b0 == 0xE0 && b1 < 0xA0)
+      return -1;
+    if (b0 == 0xED && b1 >= 0xA0)
+      return -1;
+    *out = ((uint32_t)(b0 & 0x0F) << 12) |
+           ((uint32_t)(b1 & 0x3F) << 6) | (uint32_t)(b2 & 0x3F);
+    return 3;
+  }
+  if (b0 < 0xF5) {
+    if (len < 4)
+      return -1;
+    b1 = src[1];
+    b2 = src[2];
+    b3 = src[3];
+    if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 ||
+        (b3 & 0xC0) != 0x80)
+      return -1;
+    if (b0 == 0xF0 && b1 < 0x90)
+      return -1;
+    if (b0 == 0xF4 && b1 >= 0x90)
+      return -1;
+    *out = ((uint32_t)(b0 & 0x07) << 18) |
+           ((uint32_t)(b1 & 0x3F) << 12) |
+           ((uint32_t)(b2 & 0x3F) << 6) | (uint32_t)(b3 & 0x3F);
+    return 4;
+  }
+  return -1;
+}
+
+static int32_t moonbit__utf16_write_scalar(uint16_t *dst, int32_t dst_offset,
+                                           uint32_t codepoint) {
+  if (codepoint < 0x10000) {
+    dst[dst_offset] = (uint16_t)codepoint;
+    return 1;
+  }
+  codepoint -= 0x10000;
+  dst[dst_offset] = (uint16_t)(0xD800 + (codepoint >> 10));
+  dst[dst_offset + 1] = (uint16_t)(0xDC00 + (codepoint & 0x3FF));
+  return 2;
+}
+
+#ifndef MOONBIT_USE_SIMDUTF
+static int32_t moonbit__utf8_decode_into_utf16_scalar(uint16_t *dst,
+                                                      int32_t dst_offset,
+                                                      const uint8_t *src,
+                                                      int32_t len) {
+  int32_t i = 0;
+  int32_t written = 0;
+  while (i < len) {
+    uint32_t codepoint;
+    int32_t consumed =
+        moonbit__utf8_decode_scalar_one(src + i, len - i, &codepoint);
+    if (consumed < 0)
+      return -(i + 1);
+    written += moonbit__utf16_write_scalar(dst, dst_offset + written,
+                                           codepoint);
+    i += consumed;
+  }
+  return written;
+}
+#endif
+
+static int32_t moonbit__utf8_decode_lossy_into_utf16_scalar(uint16_t *dst,
+                                                            int32_t dst_offset,
+                                                            const uint8_t *src,
+                                                            int32_t len) {
+  int32_t i = 0;
+  int32_t written = 0;
+  while (i < len) {
+    uint32_t codepoint;
+    int32_t consumed =
+        moonbit__utf8_decode_scalar_one(src + i, len - i, &codepoint);
+    if (consumed < 0) {
+      int32_t rest = len - i;
+      int32_t advance = 1;
+      uint8_t b0 = src[i];
+      if (rest >= 2) {
+        uint8_t b1 = src[i + 1];
+        if ((b0 == 0xE0 && b1 >= 0xA0 && b1 <= 0xBF) ||
+            (b0 >= 0xE1 && b0 <= 0xEC && (b1 & 0xC0) == 0x80) ||
+            (b0 == 0xED && b1 >= 0x80 && b1 <= 0x9F) ||
+            (b0 >= 0xEE && b0 <= 0xEF && (b1 & 0xC0) == 0x80)) {
+          advance = 2;
+        } else if ((b0 == 0xF0 && b1 >= 0x90 && b1 <= 0xBF) ||
+                   (b0 >= 0xF1 && b0 <= 0xF3 && (b1 & 0xC0) == 0x80) ||
+                   (b0 == 0xF4 && b1 >= 0x80 && b1 <= 0x8F)) {
+          advance = 2;
+          if (rest >= 3) {
+            uint8_t b2 = src[i + 2];
+            if ((b2 & 0xC0) == 0x80) {
+              advance = 3;
+            }
+          }
+        }
+      }
+      dst[dst_offset + written] = 0xFFFD;
+      written += 1;
+      i += advance;
+    } else {
+      written += moonbit__utf16_write_scalar(dst, dst_offset + written,
+                                             codepoint);
+      i += consumed;
+    }
+  }
+  return written;
+}
+
+typedef enum moonbit_simdutf_error_code {
+  MOONBIT_SIMDUTF_ERROR_SUCCESS = 0,
+  MOONBIT_SIMDUTF_ERROR_OTHER
+} moonbit_simdutf_error_code;
+
+typedef struct moonbit_simdutf_result {
+  moonbit_simdutf_error_code error;
+  size_t count;
+} moonbit_simdutf_result;
+
+#ifdef MOONBIT_USE_SIMDUTF
+size_t moonbit_simdutf_utf16_length_from_utf8(const char *input,
+                                              size_t length);
+size_t moonbit_simdutf_utf8_length_from_utf16(const uint16_t *input,
+                                              size_t length);
+moonbit_simdutf_result moonbit_simdutf_convert_utf8_to_utf16_with_errors(
+    const char *input, size_t length, uint16_t *output);
+moonbit_simdutf_result moonbit_simdutf_convert_utf16_to_utf8_with_errors(
+    const uint16_t *input, size_t length, char *output);
+#else
+static int32_t moonbit__utf8_encode_from_utf16_scalar(uint8_t *dst,
+                                                      int32_t dst_offset,
+                                                      const uint16_t *src,
+                                                      int32_t len) {
+  int32_t i = 0;
+  int32_t written = 0;
+  while (i < len) {
+    uint32_t codepoint;
+    uint16_t w1 = src[i];
+    if (w1 < 0xD800 || w1 > 0xDFFF) {
+      codepoint = w1;
+      i += 1;
+    } else {
+      uint16_t w2;
+      if (w1 > 0xDBFF || i + 1 >= len)
+        return -(i + 1);
+      w2 = src[i + 1];
+      if (w2 < 0xDC00 || w2 > 0xDFFF)
+        return -(i + 1);
+      codepoint =
+          0x10000 + ((((uint32_t)w1 - 0xD800) << 10) | ((uint32_t)w2 - 0xDC00));
+      i += 2;
+    }
+
+    if (codepoint < 0x80) {
+      dst[dst_offset + written] = (uint8_t)codepoint;
+      written += 1;
+    } else if (codepoint < 0x800) {
+      dst[dst_offset + written] = (uint8_t)(0xC0 | (codepoint >> 6));
+      dst[dst_offset + written + 1] = (uint8_t)(0x80 | (codepoint & 0x3F));
+      written += 2;
+    } else if (codepoint < 0x10000) {
+      dst[dst_offset + written] = (uint8_t)(0xE0 | (codepoint >> 12));
+      dst[dst_offset + written + 1] =
+          (uint8_t)(0x80 | ((codepoint >> 6) & 0x3F));
+      dst[dst_offset + written + 2] = (uint8_t)(0x80 | (codepoint & 0x3F));
+      written += 3;
+    } else {
+      dst[dst_offset + written] = (uint8_t)(0xF0 | (codepoint >> 18));
+      dst[dst_offset + written + 1] =
+          (uint8_t)(0x80 | ((codepoint >> 12) & 0x3F));
+      dst[dst_offset + written + 2] =
+          (uint8_t)(0x80 | ((codepoint >> 6) & 0x3F));
+      dst[dst_offset + written + 3] = (uint8_t)(0x80 | (codepoint & 0x3F));
+      written += 4;
+    }
+  }
+  return written;
+}
+
+static size_t moonbit_simdutf_utf16_length_from_utf8(const char *input,
+                                                     size_t length) {
+  size_t units = 0;
+  for (size_t i = 0; i < length; ++i) {
+    uint8_t byte = (uint8_t)input[i];
+    if (byte < 0x80) {
+      units += 1;
+    } else if (byte < 0xC0) {
+      units += 0;
+    } else if (byte < 0xF0) {
+      units += 1;
+    } else {
+      units += 2;
+    }
+  }
+  return units;
+}
+
+static size_t moonbit_simdutf_utf8_length_from_utf16(const uint16_t *input,
+                                                     size_t length) {
+  size_t bytes = 0;
+  for (size_t i = 0; i < length; ++i) {
+    uint16_t word = input[i];
+    bytes += 1;
+    bytes += (size_t)(word > 0x7F);
+    bytes += (size_t)((word > 0x7FF && word <= 0xD7FF) || word >= 0xE000);
+  }
+  return bytes;
+}
+
+static moonbit_simdutf_result moonbit_simdutf_convert_utf8_to_utf16_with_errors(
+    const char *input, size_t length, uint16_t *output) {
+  int32_t result = moonbit__utf8_decode_into_utf16_scalar(
+      output, 0, (const uint8_t *)input, (int32_t)length);
+  moonbit_simdutf_result out;
+  if (result < 0) {
+    out.error = MOONBIT_SIMDUTF_ERROR_OTHER;
+    out.count = (size_t)(-result - 1);
+  } else {
+    out.error = MOONBIT_SIMDUTF_ERROR_SUCCESS;
+    out.count = (size_t)result;
+  }
+  return out;
+}
+
+static moonbit_simdutf_result moonbit_simdutf_convert_utf16_to_utf8_with_errors(
+    const uint16_t *input, size_t length, char *output) {
+  int32_t result = moonbit__utf8_encode_from_utf16_scalar(
+      (uint8_t *)output, 0, input, (int32_t)length);
+  moonbit_simdutf_result out;
+  if (result < 0) {
+    out.error = MOONBIT_SIMDUTF_ERROR_OTHER;
+    out.count = (size_t)(-result - 1);
+  } else {
+    out.error = MOONBIT_SIMDUTF_ERROR_SUCCESS;
+    out.count = (size_t)result;
+  }
+  return out;
+}
+#endif
+
+MOONBIT_EXPORT int32_t moonbit_utf16_len_from_utf8(moonbit_bytes_t src,
+                                                   int32_t src_offset,
+                                                   int32_t src_length) {
+  return (int32_t)moonbit_simdutf_utf16_length_from_utf8(
+      (const char *)(src + src_offset), (size_t)src_length);
+}
+
+MOONBIT_EXPORT int32_t moonbit_utf8_decode_into_utf16(
+    moonbit_bytes_t src, int32_t src_offset, int32_t src_length,
+    moonbit_string_t dst, int32_t dst_offset) {
+  uint8_t *input = src + src_offset;
+  moonbit_simdutf_result result =
+      moonbit_simdutf_convert_utf8_to_utf16_with_errors(
+          (const char *)input, (size_t)src_length, dst + dst_offset);
+  if (result.error != MOONBIT_SIMDUTF_ERROR_SUCCESS)
+    return -((int32_t)result.count + 1);
+  return (int32_t)result.count;
+}
+
+MOONBIT_EXPORT int32_t moonbit_utf8_decode_lossy_into_utf16(
+    moonbit_bytes_t src, int32_t src_offset, int32_t src_length,
+    moonbit_string_t dst, int32_t dst_offset) {
+  uint8_t *input = src + src_offset;
+  return moonbit__utf8_decode_lossy_into_utf16_scalar(dst, dst_offset, input,
+                                                      src_length);
+}
+
+MOONBIT_EXPORT int32_t moonbit_utf8_len_from_utf16(moonbit_string_t src,
+                                                   int32_t src_offset,
+                                                   int32_t src_length) {
+  uint16_t *input = src + src_offset;
+  return (int32_t)moonbit_simdutf_utf8_length_from_utf16(input,
+                                                         (size_t)src_length);
+}
+
+MOONBIT_EXPORT int32_t moonbit_utf8_encode_from_utf16(
+    moonbit_string_t src, int32_t src_offset, int32_t src_length,
+    moonbit_bytes_t dst, int32_t dst_offset) {
+  uint16_t *input = src + src_offset;
+  moonbit_simdutf_result result =
+      moonbit_simdutf_convert_utf16_to_utf8_with_errors(
+          input, (size_t)src_length, (char *)(dst + dst_offset));
+  if (result.error != MOONBIT_SIMDUTF_ERROR_SUCCESS)
+    return -((int32_t)result.count + 1);
+  return (int32_t)result.count;
+}
+
 MOONBIT_EXPORT void moonbit_unsafe_bytes_blit(moonbit_bytes_t dst,
                                               int32_t dst_start,
                                               moonbit_bytes_t src,
@@ -1470,15 +2087,176 @@ MOONBIT_EXPORT moonbit_string_t moonbit_unsafe_bytes_sub_string(
   return str;
 }
 
-#ifdef _WIN32
-#include <windows.h>
-#endif
+MOONBIT_EXPORT int32_t moonbit_unsafe_ref_array_blit(void *dst,
+                                                     int32_t dst_offset,
+                                                     void *src,
+                                                     int32_t src_offset,
+                                                     int32_t len) {
+  void **dst_ptrs = (void **)dst;
+  void **src_ptrs = (void **)src;
+  int32_t dst_end = dst_offset + len;
+  int32_t src_end = src_offset + len;
+  int32_t dst_len = Moonbit_array_length(dst_ptrs);
+  int32_t src_len = Moonbit_array_length(src_ptrs);
+  if (dst_offset < 0 || dst_end > dst_len || src_offset < 0 ||
+      src_end > src_len) {
+    moonbit_panic();
+  }
+  struct moonbit_object *src_header = Moonbit_object_header(src_ptrs);
+  int32_t const src_rc = src_header->rc;
+  if (raw_rc_is_shared(src_rc)) {
+    src_header->rc = src_rc - MOONBIT_RC_COUNT_UNIT;
+  } else if (raw_rc_is_dynamic(src_rc)) {
+    for (int32_t i = 0; i < src_offset; ++i) {
+      if (src_ptrs[i])
+        moonbit_decref(src_ptrs[i]);
+    }
+    for (int32_t i = src_end; i < src_len; ++i) {
+      if (src_ptrs[i])
+        moonbit_decref(src_ptrs[i]);
+    }
+    for (int32_t i = dst_offset; i < dst_end; ++i) {
+      if (dst_ptrs[i])
+        moonbit_decref(dst_ptrs[i]);
+    }
+    // since `src` is unique, it must not overlap with `dst`
+    memcpy(dst_ptrs + dst_offset, src_ptrs + src_offset, len * sizeof(void *));
+    moonbit_free(src_ptrs);
+    moonbit_decref(dst_ptrs);
+    return 0;
+  }
+  for (int32_t i = src_offset; i < src_end; ++i) {
+    if (src_ptrs[i])
+      moonbit_incref(src_ptrs[i]);
+  }
+  for (int32_t i = dst_offset; i < dst_end; ++i) {
+    if (dst_ptrs[i])
+      moonbit_decref(dst_ptrs[i]);
+  }
+  memmove(dst_ptrs + dst_offset, src_ptrs + src_offset, len * sizeof(void *));
+  moonbit_decref(dst_ptrs);
+  return 0;
+}
+
+MOONBIT_EXPORT int32_t moonbit_unsafe_val_array_blit(uint8_t *dst,
+                                                     int32_t dst_offset,
+                                                     uint8_t *src,
+                                                     int32_t src_offset,
+                                                     int32_t len,
+                                                     int32_t elem_size) {
+  int32_t dst_end = dst_offset + len;
+  int32_t src_end = src_offset + len;
+  int32_t dst_len = Moonbit_array_length(dst);
+  int32_t src_len = Moonbit_array_length(src);
+  if (dst_offset < 0 || dst_end > dst_len || src_offset < 0 ||
+      src_end > src_len) {
+    moonbit_panic();
+  }
+  memmove(dst + dst_offset * elem_size, src + src_offset * elem_size,
+          len * elem_size);
+  moonbit_decref(src);
+  moonbit_decref(dst);
+  return 0;
+}
+
+MOONBIT_EXPORT void **moonbit_make_ref_array_with_blit(
+    int32_t allocate_len, void *value, void *src, int32_t src_offset,
+    int32_t dst_offset, int32_t len) {
+  void **dst_ptrs = moonbit_make_ref_array_raw(allocate_len);
+  void **src_ptrs = (void **)src;
+  int32_t dst_end = dst_offset + len;
+  int32_t src_end = src_offset + len;
+  int32_t src_len = Moonbit_array_length(src_ptrs);
+  int32_t init_slots = allocate_len - len;
+  if (value) {
+    if (init_slots == 0) {
+      moonbit_decref(value);
+    } else {
+      struct moonbit_object *value_header = Moonbit_object_header(value);
+      int32_t const count = Moonbit_rc_count(value_header);
+      if (count > 0 && init_slots > 1) {
+        Moonbit_set_rc_count(value_header,
+                             (uint32_t)count + (uint32_t)init_slots - 1u);
+      }
+    }
+  }
+  for (int32_t i = 0; i < dst_offset; ++i) {
+    dst_ptrs[i] = value;
+  }
+  for (int32_t i = dst_end; i < allocate_len; ++i) {
+    dst_ptrs[i] = value;
+  }
+  struct moonbit_object *src_header = Moonbit_object_header(src_ptrs);
+  int32_t const src_rc = src_header->rc;
+  if (raw_rc_is_shared(src_rc)) {
+    src_header->rc = src_rc - MOONBIT_RC_COUNT_UNIT;
+  } else if (raw_rc_is_dynamic(src_rc)) {
+    for (int32_t i = 0; i < src_offset; ++i) {
+      if (src_ptrs[i])
+        moonbit_decref(src_ptrs[i]);
+    }
+    for (int32_t i = src_end; i < src_len; ++i) {
+      if (src_ptrs[i])
+        moonbit_decref(src_ptrs[i]);
+    }
+    memcpy(dst_ptrs + dst_offset, src_ptrs + src_offset, len * sizeof(void *));
+    moonbit_free(src_ptrs);
+    return dst_ptrs;
+  }
+  for (int32_t i = src_offset; i < src_end; ++i) {
+    if (src_ptrs[i])
+      moonbit_incref(src_ptrs[i]);
+  }
+  memcpy(dst_ptrs + dst_offset, src_ptrs + src_offset, len * sizeof(void *));
+  return dst_ptrs;
+}
 
 MOONBIT_EXPORT void moonbit_println(moonbit_string_t str) {
 #ifdef _WIN32
-  unsigned int prev_cp = GetConsoleOutputCP();
-  SetConsoleOutputCP(CP_UTF8);
+  static HANDLE stdout_handle = INVALID_HANDLE_VALUE;
+  static BOOL stdout_is_console = 0;
+  static const DWORD max_chunk_size = 1 << 14; // 16K
+
+  if (stdout_handle == INVALID_HANDLE_VALUE) {
+    stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+
+    if (stdout_handle == INVALID_HANDLE_VALUE) {
+      // There is no stdout. Simply ignore the message
+      return;
+    }
+
+    DWORD mode;
+    stdout_is_console = GetConsoleMode(stdout_handle, &mode);
+  }
+
+  if (stdout_is_console) {
+    // When stdout is a real console,
+    // use `WriteConsoleW` to output with current code page of the console.
+    DWORD len = Moonbit_array_length(str);
+    DWORD written = 0, total_written = 0;
+    while (total_written < len) {
+      DWORD chars_to_write = len - total_written;
+      if (chars_to_write > max_chunk_size)
+        chars_to_write = max_chunk_size;
+
+      BOOL ret = WriteConsoleW(
+        stdout_handle,
+        ((WCHAR*)str) + total_written,
+        chars_to_write,
+        &written,
+        NULL
+      );
+
+      if (!ret) return;
+      total_written += written;
+    }
+    WriteConsoleW(stdout_handle, L"\n", 1, NULL, NULL);
+    return;
+  }
+
+  // For redirected stdout, output UTF-8
 #endif
+
   int32_t const len = Moonbit_array_length(str);
   for (int32_t i = 0; i < len; ++i) {
     uint32_t c = str[i];
@@ -1506,9 +2284,6 @@ MOONBIT_EXPORT void moonbit_println(moonbit_string_t str) {
     }
   }
   putchar('\n');
-#ifdef _WIN32
-  SetConsoleOutputCP(prev_cp);
-#endif
 }
 
 MOONBIT_EXPORT int32_t *moonbit_make_int32_array_raw(int32_t len) {
@@ -1543,9 +2318,9 @@ MOONBIT_EXPORT void **moonbit_make_ref_array(int32_t len, void *value) {
 
   if (value) {
     struct moonbit_object *value_header = Moonbit_object_header(value);
-    const int32_t count = value_header->rc;
+    const int32_t count = Moonbit_rc_count(value_header);
     if (count > 0 && len > 1) {
-      value_header->rc = count + len - 1;
+      Moonbit_set_rc_count(value_header, (uint32_t)count + (uint32_t)len - 1u);
     }
   }
   for (int32_t i = 0; i < len; ++i) {
@@ -1616,10 +2391,22 @@ static struct {
   uint32_t meta;
   void *data[];
 } moonbit_empty_scalar_valtype_array_object = {
-    -1, Moonbit_make_array_header(moonbit_BLOCK_KIND_VAL_ARRAY, 0, 0)};
+    Moonbit_make_static_rc(moonbit_BLOCK_KIND_VAL_ARRAY),
+    0};
 
 MOONBIT_EXPORT void *const moonbit_empty_scalar_valtype_array =
     moonbit_empty_scalar_valtype_array_object.data;
+
+static struct {
+  int32_t rc;
+  uint32_t meta;
+  moonbit_v128_storage_t data[];
+} moonbit_empty_v128_array_object = {
+    Moonbit_make_static_rc(moonbit_BLOCK_KIND_VAL_ARRAY),
+    0};
+
+MOONBIT_EXPORT moonbit_v128_storage_t *const moonbit_empty_v128_array =
+    moonbit_empty_v128_array_object.data;
 
 MOONBIT_EXPORT void *moonbit_make_scalar_valtype_array(int32_t len,
                                                        size_t valtype_size,
@@ -1635,13 +2422,43 @@ MOONBIT_EXPORT void *moonbit_make_scalar_valtype_array(int32_t len,
 
 MOONBIT_EXPORT void *
 moonbit_make_scalar_valtype_array_raw(int32_t len, size_t valtype_size) {
+  if (len < 0)
+    moonbit_panic();
   if (len == 0)
     return moonbit_empty_scalar_valtype_array;
+  // All-scalar value-type arrays have no references to scan, so they use the
+  // ordinary all-scalar array representation and do not carry the extra
+  // value-type-array header.
   struct moonbit_object *obj = (struct moonbit_object *)malloc(
       len * valtype_size + sizeof(struct moonbit_object));
-  obj->rc = 1;
-  obj->meta = Moonbit_make_array_header(moonbit_BLOCK_KIND_VAL_ARRAY, 0, len);
+  Moonbit_init_dynamic_rc(obj, moonbit_BLOCK_KIND_VAL_ARRAY);
+  Moonbit_set_meta(obj, (uint32_t)len);
   return (void *)(obj + 1);
+}
+
+MOONBIT_EXPORT moonbit_v128_storage_t *
+moonbit_make_v128_array(int32_t len, uint64_t lo, uint64_t hi) {
+  moonbit_v128_storage_t *array = moonbit_make_v128_array_raw(len);
+  if (array) {
+    for (int32_t i = 0; i < len; ++i) {
+      array[i].lo = lo;
+      array[i].hi = hi;
+    }
+  }
+  return array;
+}
+
+MOONBIT_EXPORT moonbit_v128_storage_t *moonbit_make_v128_array_raw(int32_t len) {
+  if (len < 0)
+    moonbit_panic();
+  if (len == 0)
+    return moonbit_empty_v128_array;
+  struct moonbit_object *obj = (struct moonbit_object *)malloc(
+      (size_t)len * sizeof(moonbit_v128_storage_t) +
+      sizeof(struct moonbit_object));
+  Moonbit_init_dynamic_rc(obj, moonbit_BLOCK_KIND_VAL_ARRAY);
+  Moonbit_set_meta(obj, (uint32_t)len);
+  return (moonbit_v128_storage_t *)(obj + 1);
 }
 
 static struct {
@@ -1649,29 +2466,37 @@ static struct {
   uint32_t meta;
   void *data[];
 } moonbit_empty_ref_valtype_array_object = {
-    -1, Moonbit_make_array_header(moonbit_BLOCK_KIND_REF_ARRAY,
-                                  moonbit_REF_ARRAY_REF_VALTYPE, 0)};
+    Moonbit_make_static_rc(moonbit_BLOCK_KIND_REF_VALTYPE_ARRAY),
+    0};
 
 MOONBIT_EXPORT void *const moonbit_empty_ref_valtype_array =
     moonbit_empty_ref_valtype_array_object.data;
 
 MOONBIT_EXPORT void moonbit_update_ref_valtype_rc(int32_t len, void *value,
-                                                  uint32_t header) {
-  const int32_t ptr_field_offset = Moonbit_header_ptr_field_offset(header);
-  const int32_t n_ptr_fields = Moonbit_header_ptr_field_count(header);
-  void **ptrs = (void **)(((uint32_t *)value) + ptr_field_offset);
+                                                  uint32_t layout_meta) {
+  // Static references of a value-struct element. Embedded value enums (is_venum
+  // children) carry their own tag-dependent references and are adjusted by
+  // moonbit_update_ref_enum_valtype_rc instead, so skip them here.
+  uint32_t n = Moonbit_header_child_count(layout_meta);
   if (len == 0) {
-    for (int32_t i = 0; i < n_ptr_fields; ++i) {
-      if (ptrs[i])
-        moonbit_decref(ptrs[i]);
+    for (uint32_t i = 0; i < n; ++i) {
+      if (Moonbit_header_child_tagged(layout_meta, i) & 1u)
+        continue;
+      void **ptrs = ref_slot_at(layout_meta, value, (int32_t)i);
+      if (*ptrs)
+        moonbit_decref(*ptrs);
     }
   } else if (len > 1) {
-    for (int32_t i = 0; i < n_ptr_fields; ++i) {
-      if (ptrs[i]) {
-        struct moonbit_object *value_header = Moonbit_object_header(ptrs[i]);
-        const int32_t count = value_header->rc;
+    for (uint32_t i = 0; i < n; ++i) {
+      if (Moonbit_header_child_tagged(layout_meta, i) & 1u)
+        continue;
+      void **ptrs = ref_slot_at(layout_meta, value, (int32_t)i);
+      if (*ptrs) {
+        struct moonbit_object *value_header = Moonbit_object_header(*ptrs);
+        const int32_t count = Moonbit_rc_count(value_header);
         if (count > 0) {
-          value_header->rc = count + len - 1;
+          Moonbit_set_rc_count(value_header,
+                               (uint32_t)count + (uint32_t)len - 1u);
         }
       }
     }
@@ -1680,9 +2505,10 @@ MOONBIT_EXPORT void moonbit_update_ref_valtype_rc(int32_t len, void *value,
 
 MOONBIT_EXPORT void *moonbit_make_ref_valtype_array(int32_t len,
                                                     size_t valtype_size,
-                                                    uint32_t header,
+                                                    uint32_t layout_meta,
                                                     void *init) {
-  void *array = moonbit_make_ref_valtype_array_raw(len, valtype_size, header);
+  void *array =
+      moonbit_make_ref_valtype_array_raw(len, valtype_size, layout_meta);
   if (array) {
     for (int32_t i = 0; i < len; ++i) {
       memcpy((uint8_t *)array + i * valtype_size, init, valtype_size);
@@ -1693,7 +2519,9 @@ MOONBIT_EXPORT void *moonbit_make_ref_valtype_array(int32_t len,
 
 MOONBIT_EXPORT void *moonbit_make_ref_valtype_array_raw(int32_t len,
                                                         size_t valtype_size,
-                                                        uint32_t header) {
+                                                        uint32_t layout_meta) {
+  if (len < 0)
+    moonbit_panic();
   if (len == 0)
     return moonbit_empty_ref_valtype_array;
   // the extra header is 4-byte but we allocate extra 8-byte for better
@@ -1701,20 +2529,18 @@ MOONBIT_EXPORT void *moonbit_make_ref_valtype_array_raw(int32_t len,
   size_t const total_size =
       len * valtype_size + sizeof(struct moonbit_object) + sizeof(void *);
   struct moonbit_object *obj = (struct moonbit_object *)malloc(total_size);
-  *(uint64_t *)obj = (uint64_t)header;
+  *(uint64_t *)obj = (uint64_t)layout_meta;
   obj = (struct moonbit_object *)(((uint64_t *)obj) + 1);
-  obj->rc = 1;
-  obj->meta = Moonbit_make_array_header(moonbit_BLOCK_KIND_REF_ARRAY,
-                                        moonbit_REF_ARRAY_REF_VALTYPE, len);
+  Moonbit_init_dynamic_rc(obj, moonbit_BLOCK_KIND_REF_VALTYPE_ARRAY);
+  Moonbit_set_meta(obj, (uint32_t)len);
   return (void *)(obj + 1);
 }
 
 MOONBIT_EXPORT void *moonbit_make_external_object(void (*finalize)(void *self),
                                                   uint32_t payload_size) {
   void *result = moonbit_malloc(sizeof(void (*)(void *)) + payload_size);
-  Moonbit_object_header(result)->meta =
-      ((uint32_t)moonbit_BLOCK_KIND_EXTERNAL << 30) |
-      (payload_size & ((1 << 30) - 1));
+  Moonbit_set_meta(Moonbit_object_header(result),
+                   Moonbit_make_external_object_header(payload_size));
   void (**addr_of_finalize)(void *) =
       (void (**)(void *))((uint8_t *)result + payload_size);
   *addr_of_finalize = finalize;
@@ -1726,7 +2552,8 @@ static struct {
   uint32_t meta;
   uint8_t data[];
 } moonbit_empty_int8_array_object = {
-    -1, Moonbit_make_array_header(moonbit_BLOCK_KIND_VAL_ARRAY, 2, 0)};
+    Moonbit_make_static_rc(moonbit_BLOCK_KIND_VAL_ARRAY),
+    0};
 
 MOONBIT_EXPORT uint8_t *const moonbit_empty_int8_array =
     moonbit_empty_int8_array_object.data;
@@ -1736,7 +2563,8 @@ static struct {
   uint32_t meta;
   uint16_t data[];
 } moonbit_empty_int16_array_object = {
-    -1, Moonbit_make_array_header(moonbit_BLOCK_KIND_VAL_ARRAY, 2, 0)};
+    Moonbit_make_static_rc(moonbit_BLOCK_KIND_VAL_ARRAY),
+    0};
 
 MOONBIT_EXPORT uint16_t *const moonbit_empty_int16_array =
     moonbit_empty_int16_array_object.data;
@@ -1746,7 +2574,8 @@ static struct {
   uint32_t meta;
   int32_t data[];
 } moonbit_empty_int32_array_object = {
-    -1, Moonbit_make_array_header(moonbit_BLOCK_KIND_VAL_ARRAY, 2, 0)};
+    Moonbit_make_static_rc(moonbit_BLOCK_KIND_VAL_ARRAY),
+    0};
 
 MOONBIT_EXPORT int32_t *const moonbit_empty_int32_array =
     moonbit_empty_int32_array_object.data;
@@ -1756,7 +2585,8 @@ static struct {
   uint32_t meta;
   int64_t data[];
 } moonbit_empty_int64_array_object = {
-    -1, Moonbit_make_array_header(moonbit_BLOCK_KIND_VAL_ARRAY, 3, 0)};
+    Moonbit_make_static_rc(moonbit_BLOCK_KIND_VAL_ARRAY),
+    0};
 
 MOONBIT_EXPORT int64_t *const moonbit_empty_int64_array =
     moonbit_empty_int64_array_object.data;
@@ -1766,7 +2596,8 @@ static struct {
   uint32_t meta;
   float data[];
 } moonbit_empty_float_array_object = {
-    -1, Moonbit_make_array_header(moonbit_BLOCK_KIND_VAL_ARRAY, 2, 0)};
+    Moonbit_make_static_rc(moonbit_BLOCK_KIND_VAL_ARRAY),
+    0};
 
 MOONBIT_EXPORT float *const moonbit_empty_float_array =
     moonbit_empty_float_array_object.data;
@@ -1776,7 +2607,8 @@ static struct {
   uint32_t meta;
   double data[];
 } moonbit_empty_double_array_object = {
-    -1, Moonbit_make_array_header(moonbit_BLOCK_KIND_VAL_ARRAY, 3, 0)};
+    Moonbit_make_static_rc(moonbit_BLOCK_KIND_VAL_ARRAY),
+    0};
 
 MOONBIT_EXPORT double *const moonbit_empty_double_array =
     moonbit_empty_double_array_object.data;
@@ -1786,8 +2618,8 @@ static struct {
   uint32_t meta;
   void *data[];
 } moonbit_empty_ref_array_object = {
-    -1, Moonbit_make_array_header(moonbit_BLOCK_KIND_REF_ARRAY,
-                                  (sizeof(void *) >> 2) + 1, 0)};
+    Moonbit_make_static_rc(moonbit_BLOCK_KIND_REF_ARRAY),
+    0};
 
 MOONBIT_EXPORT void **const moonbit_empty_ref_array =
     moonbit_empty_ref_array_object.data;
@@ -1797,8 +2629,8 @@ static struct {
   uint32_t meta;
   void *data[];
 } moonbit_empty_extern_ref_array_object = {
-    -1, Moonbit_make_array_header(moonbit_BLOCK_KIND_VAL_ARRAY,
-                                  (sizeof(void *) >> 2) + 1, 0)};
+    Moonbit_make_static_rc(moonbit_BLOCK_KIND_VAL_ARRAY),
+    0};
 
 MOONBIT_EXPORT void **const moonbit_empty_extern_ref_array =
     moonbit_empty_extern_ref_array_object.data;
@@ -1823,6 +2655,19 @@ MOONBIT_EXPORT void moonbit_runtime_init(int argc, char **argv) {
   __moonbit_internal_argv = argv;
 }
 
+#ifdef _WIN32
+
+typedef moonbit_string_t moonbit_os_string_t;
+#define moonbit_empty_os_string moonbit_empty_int16_array
+
+#else
+
+typedef moonbit_bytes_t moonbit_os_string_t;
+#define moonbit_empty_os_string moonbit_empty_int8_array
+
+#endif
+
+
 #ifndef MOONBIT_NATIVE_NO_SYS_HEADER
 
 #include <errno.h>
@@ -1830,12 +2675,334 @@ MOONBIT_EXPORT void moonbit_runtime_init(int argc, char **argv) {
 #include <time.h>
 
 #ifdef _WIN32
+
 #include <direct.h>
-#else
+
+#else // #ifdef _WIN32
+
 #include <dirent.h>
+#include <sys/random.h>
 #include <sys/time.h>
 #include <unistd.h>
+
+#endif // #ifndef _WIN32
+
+#endif // #ifndef MOONBIT_NATIVE_NO_SYS_HEADER
+
+MOONBIT_EXPORT int32_t moonbit_rt_get_random(moonbit_bytes_t buf) {
+  int32_t len = Moonbit_array_length(buf);
+  if (len <= 0) return 0;
+#ifdef MOONBIT_NATIVE_NO_SYS_HEADER
+  return -1;
+#elif defined(_MSC_VER)
+  NTSTATUS status =
+      BCryptGenRandom(NULL, buf, (ULONG)len, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+  return status != 0 ? -1 : 0;
+#elif defined(_WIN32)
+  for (int32_t i = 0; i < len; i += 4) {
+    unsigned int word;
+    if (rand_s(&word) != 0) return -1;
+    int32_t copy = (len - i < 4) ? (len - i) : 4;
+    memcpy(buf + i, &word, copy);
+  }
+  return 0;
+#else
+  for (int32_t i = 0; i < len;) {
+    size_t chunk = (size_t)(len - i);
+    if (chunk > 256) chunk = 256;
+    if (getentropy(buf + i, chunk) != 0) return -1;
+    i += (int32_t)chunk;
+  }
+  return 0;
 #endif
+}
+
+MOONBIT_FFI_EXPORT
+moonbit_os_string_t *moonbit_rt_get_cli_args(void) {
+#ifdef _MSC_VER
+
+  LPWSTR command_line = GetCommandLineW();
+
+  int argc = 0;
+  LPWSTR *argv = CommandLineToArgvW(command_line, &argc);
+
+  if (!argv)
+    return (moonbit_os_string_t*)moonbit_empty_ref_array;
+
+  moonbit_os_string_t *result = (moonbit_os_string_t*)moonbit_make_ref_array_raw(argc);
+  for (int i = 0; i < argc; ++i) {
+    LPWSTR raw_arg = argv[i];
+    int len = wcslen(raw_arg);
+    moonbit_os_string_t arg = moonbit_make_string_raw(len);
+    memcpy(arg, raw_arg, len * sizeof(WCHAR));
+    result[i] = arg;
+  }
+
+  LocalFree(argv);
+  return result;
+
+#elif defined(_WIN32)
+
+  // mingw does not support `#pragma comment`,
+  // so we cannot link `Shell32` and use `CommandLineToArgvW`.
+  // Fallback to (unicode-unsafe) ANSI processing.
+  // Note that the MoonBit side still requires UTF-16 string,
+  // so we need to manually do the translation here.
+  moonbit_os_string_t *result =
+    (moonbit_os_string_t*)moonbit_make_ref_array_raw(__moonbit_internal_argc);
+
+  for (int i = 0; i < __moonbit_internal_argc; ++i) {
+    int len = strlen(__moonbit_internal_argv[i]);
+    moonbit_os_string_t arg = moonbit_make_string_raw(len);
+
+    // Assume ANSI only, decode to UTF16-LE
+    for (int j = 0; j < len; ++j) {
+      ((char*)arg)[j * 2] = __moonbit_internal_argv[i][j];
+      ((char*)arg)[j * 2 + 1] = 0;
+    }
+
+    result[i] = arg;
+  }
+
+  return result;
+
+#else
+
+  moonbit_os_string_t *result =
+    (moonbit_os_string_t*)moonbit_make_ref_array_raw(__moonbit_internal_argc);
+
+  for (int i = 0; i < __moonbit_internal_argc; ++i) {
+    int len = strlen(__moonbit_internal_argv[i]);
+    moonbit_os_string_t arg = moonbit_make_bytes_raw(len);
+    memcpy(arg, __moonbit_internal_argv[i], len);
+    result[i] = arg;
+  }
+
+  return result;
+
+#endif
+}
+
+
+#ifndef MOONBIT_NATIVE_NO_SYS_HEADER
+
+MOONBIT_FFI_EXPORT
+moonbit_os_string_t moonbit_rt_get_current_dir(void) {
+#ifdef _WIN32
+
+  WCHAR buf[1024];
+
+  DWORD size = GetCurrentDirectoryW(1024, buf);
+  moonbit_os_string_t result;
+
+  if (size < 1024) {
+    result = moonbit_make_string_raw(size);
+    memcpy(result, buf, size * sizeof(WCHAR));
+  } else {
+    result = moonbit_make_string_raw(size - 1);
+    GetCurrentDirectoryW(size, result);
+  }
+
+  return result;
+
+#else
+
+  char buf[1024];
+  char *cwd = buf;
+
+  if (!getcwd(buf, 1024)) {
+    if (errno != ERANGE)
+      return moonbit_empty_os_string;
+
+    cwd = getcwd(NULL, 0);
+  }
+
+  int len = strlen(cwd);
+  moonbit_os_string_t result = moonbit_make_bytes_raw(len);
+  memcpy(result, cwd, len);
+
+  if (cwd != buf)
+    free(cwd);
+
+  return result;
+
+#endif
+}
+
+MOONBIT_EXPORT
+moonbit_os_string_t moonbit_rt_get_env_var2(moonbit_os_string_t key, int32_t *exists) {
+#ifdef _WIN32
+
+  WCHAR buffer[1024];
+
+  SetLastError(0);
+  DWORD len = GetEnvironmentVariableW((LPCWSTR)key, buffer, sizeof(buffer) / sizeof(WCHAR));
+
+  if (len == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND) {
+    *exists = 0;
+    return moonbit_empty_os_string;
+  }
+
+  *exists = 1;
+  moonbit_os_string_t result;
+  if (len < 1024) {
+    // The static buffer is large enough to hold the data,
+    // no need for an extra `GetEnvironmentVariablesW` call.
+    result = moonbit_make_string_raw(len);
+    memcpy(result, buffer, len * sizeof(WCHAR));
+  } else {
+    // In case the buffer is not large enough,
+    // the returned length INCLUDES the terminating NUL.
+    // Since `String` has its own trailing NUL in MoonBit,
+    // exclude the trailing NUL when allocating the result.
+    result = moonbit_make_string_raw(len - 1);
+    GetEnvironmentVariableW((LPCWSTR)key, result, len);
+  }
+
+  return result;
+
+#else
+
+  const char *value = getenv((const char*)key);
+  if (!value) {
+    *exists = 0;
+    return moonbit_empty_os_string;
+  }
+
+  *exists = 1;
+  int len = strlen(value);
+  moonbit_os_string_t result = moonbit_make_bytes_raw(len);
+  memcpy(result, value, len);
+
+  return result;
+
+#endif
+}
+
+MOONBIT_EXPORT
+moonbit_os_string_t *moonbit_rt_get_env_vars2(void) {
+#ifdef _WIN32
+
+  LPWCH env_str = GetEnvironmentStringsW();
+  if (!env_str)
+    return (moonbit_os_string_t*)moonbit_empty_ref_array;
+
+  // `env_str` is a NUL-separated list of environment block entries.
+  // Each entry can be either:
+  // 
+  // 1. a normal entry of the form `A=B`
+  // 2. a pseudo entry of the from `=...`. We should skip this
+  // 
+  // an empty entry indicates end of the list
+
+  // count the first block
+  int count = (env_str[0] != '=' && env_str[0] != 0) ? 1 : 0;
+  for (int i = 0;; ++i) {
+    // end of a single env var block is indicated by '\0'
+    if (env_str[i] != 0)
+      continue;
+
+    // an empty block indicates end of the whole environment string
+    if (env_str[i + 1] == 0)
+      break;
+
+    // count the next block
+    if (env_str[i + 1] != '=')
+      ++count;
+  }
+
+  moonbit_os_string_t *result = (moonbit_os_string_t*)moonbit_make_ref_array_raw(count * 2);
+
+  LPWCH start_of_block = env_str;
+  for (int block_index = 0; block_index < count;) {
+    int key_len = -1, block_len = 0;
+    while (start_of_block[block_len] != 0) {
+      if (start_of_block[block_len] == L'=' && key_len < 0)
+        key_len = block_len;
+
+      ++block_len;
+    }
+
+    if (key_len < 0)
+      // this should not happen, but if there is no `=` in the env block,
+      // treat the whole block as key and the value as empty
+      key_len = block_len;
+
+    if (key_len > 0) {
+      // exclude pseudo environment entry
+      moonbit_os_string_t key = moonbit_make_string_raw(key_len);
+      memcpy(key, start_of_block, key_len * sizeof(WCHAR));
+
+      int value_len = block_len - key_len - 1;
+      moonbit_os_string_t value = moonbit_make_string_raw(value_len);
+      memcpy(value, start_of_block + key_len + 1, value_len * sizeof(WCHAR));
+
+      result[block_index * 2] = key;
+      result[block_index * 2 + 1] = value;
+
+      ++block_index;
+    }
+
+    start_of_block += block_len + 1;
+  }
+
+  FreeEnvironmentStringsW(env_str);
+  return result;
+
+#else
+
+  extern char **environ;
+
+  int count = 0;
+  char **env = environ;
+  while (*env != NULL) {
+    count++;
+    env++;
+  }
+
+  moonbit_os_string_t *result = (moonbit_os_string_t*)moonbit_make_ref_array_raw(count * 2);
+  env = environ;
+  int i = 0;
+  while (*env != NULL) {
+    char *equals = strchr(*env, '=');
+    if (equals != NULL) {
+      size_t key_len = equals - *env;
+      size_t val_len = strlen(equals + 1);
+
+      moonbit_bytes_t key_bytes = moonbit_make_bytes_raw(key_len);
+      memcpy(key_bytes, *env, key_len);
+
+      moonbit_bytes_t value_bytes = moonbit_make_bytes_raw(val_len);
+      memcpy(value_bytes, equals + 1, val_len);
+
+      result[i * 2] = key_bytes;
+      result[(i * 2) + 1] = value_bytes;
+    }
+    env++;
+    i++;
+  }
+  return result;
+
+#endif
+}
+
+MOONBIT_EXPORT
+void moonbit_rt_set_env_var2(moonbit_os_string_t key, moonbit_os_string_t value) {
+#ifdef _WIN32
+  SetEnvironmentVariableW((LPCWSTR)key, (LPCWSTR)value);
+#else
+  setenv((const char *)key, (const char *)value, 1);
+#endif
+}
+
+MOONBIT_EXPORT
+void moonbit_rt_unset_env_var2(moonbit_os_string_t key) {
+#ifdef _WIN32
+  SetEnvironmentVariableW((LPCWSTR)key, NULL);
+#else
+  unsetenv((const char *)key);
+#endif
+}
 
 /* Environment variable format notes:
    - On Unix/POSIX, `environ` is a NULL-terminated array of byte strings in

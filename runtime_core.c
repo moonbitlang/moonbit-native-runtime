@@ -19,6 +19,7 @@ extern "C" {
 #endif
 
 #include "moonbit.h"
+#include "moonbit_simd.h"
 
 #ifdef _MSC_VER
 #define _Noreturn __declspec(noreturn)
@@ -32,7 +33,10 @@ extern "C" {
 MOONBIT_EXPORT _Noreturn void moonbit_panic(void);
 MOONBIT_EXPORT void *moonbit_malloc_array(enum moonbit_block_kind kind,
                                           int elem_size_shift, int32_t len);
-MOONBIT_EXPORT int moonbit_val_array_equal(const void *lhs, const void *rhs);
+int memcmp(const void *s1, const void *s2, size_t n);
+MOONBIT_EXPORT int moonbit_val_array_equal_sized(const void *lhs,
+                                                 const void *rhs,
+                                                 int32_t elem_size);
 MOONBIT_EXPORT moonbit_string_t moonbit_add_string(moonbit_string_t s1,
                                                    moonbit_string_t s2);
 MOONBIT_EXPORT void moonbit_unsafe_bytes_blit(moonbit_bytes_t dst,
@@ -41,24 +45,41 @@ MOONBIT_EXPORT void moonbit_unsafe_bytes_blit(moonbit_bytes_t dst,
                                               int32_t src_offset, int32_t len);
 MOONBIT_EXPORT moonbit_string_t moonbit_unsafe_bytes_sub_string(
     moonbit_bytes_t bytes, int32_t start, int32_t len);
+MOONBIT_EXPORT int32_t moonbit_unsafe_val_array_blit(void *dst,
+                                                     int32_t dst_offset,
+                                                     void *src,
+                                                     int32_t src_offset,
+                                                     int32_t len,
+                                                     int32_t elem_size);
+MOONBIT_EXPORT int32_t moonbit_unsafe_ref_array_blit(void *dst,
+                                                     int32_t dst_offset,
+                                                     void *src,
+                                                     int32_t src_offset,
+                                                     int32_t len);
 MOONBIT_EXPORT void moonbit_println(moonbit_string_t str);
 MOONBIT_EXPORT moonbit_bytes_t *moonbit_get_cli_args(void);
 MOONBIT_EXPORT void moonbit_runtime_init(int argc, char **argv);
 MOONBIT_EXPORT void moonbit_drop_object(void *);
-
-#define Moonbit_make_regular_object_header(ptr_field_offset, ptr_field_count,  \
-                                           tag)                                \
-  (((uint32_t)moonbit_BLOCK_KIND_REGULAR << 30) |                              \
-   (((uint32_t)(ptr_field_offset) & (((uint32_t)1 << 11) - 1)) << 19) |        \
-   (((uint32_t)(ptr_field_count) & (((uint32_t)1 << 11) - 1)) << 8) |          \
-   ((tag) & 0xFF))
-
-// header manipulation macros
-#define Moonbit_object_ptr_field_offset(obj)                                   \
-  ((Moonbit_object_header(obj)->meta >> 19) & (((uint32_t)1 << 11) - 1))
-
-#define Moonbit_object_ptr_field_count(obj)                                    \
-  ((Moonbit_object_header(obj)->meta >> 8) & (((uint32_t)1 << 11) - 1))
+// Slow paths of the inlined value-enum retain/release below (defined in
+// runtime.c). Internal helpers, so declared here rather than in the public
+// moonbit.h; reached only when a value's current variant carries references.
+MOONBIT_EXPORT void moonbit_incref_value_enum_loop(void *p);
+MOONBIT_EXPORT void moonbit_decref_value_enum_loop(void *p);
+MOONBIT_EXPORT int32_t moonbit_utf16_len_from_utf8(moonbit_bytes_t src,
+                                                   int32_t src_offset,
+                                                   int32_t src_length);
+MOONBIT_EXPORT int32_t moonbit_utf8_decode_into_utf16(
+    moonbit_bytes_t src, int32_t src_offset, int32_t src_length,
+    moonbit_string_t dst, int32_t dst_offset);
+MOONBIT_EXPORT int32_t moonbit_utf8_decode_lossy_into_utf16(
+    moonbit_bytes_t src, int32_t src_offset, int32_t src_length,
+    moonbit_string_t dst, int32_t dst_offset);
+MOONBIT_EXPORT int32_t moonbit_utf8_len_from_utf16(moonbit_string_t src,
+                                                   int32_t src_offset,
+                                                   int32_t src_length);
+MOONBIT_EXPORT int32_t moonbit_utf8_encode_from_utf16(
+    moonbit_string_t src, int32_t src_offset, int32_t src_length,
+    moonbit_bytes_t dst, int32_t dst_offset);
 
 #if !defined(_WIN64) && !defined(_WIN32)
 void *malloc(size_t size);
@@ -71,18 +92,30 @@ void free(void *ptr);
 static void *moonbit_malloc_inlined(size_t size) {
   struct moonbit_object *ptr = (struct moonbit_object *)libc_malloc(
       sizeof(struct moonbit_object) + size);
-  ptr->rc = 1;
+  Moonbit_init_dynamic_rc(ptr, moonbit_BLOCK_KIND_REGULAR);
   return ptr + 1;
 }
 
 #define moonbit_malloc(obj) moonbit_malloc_inlined(obj)
 #define moonbit_free(obj) libc_free(Moonbit_object_header(obj))
 
+#define MOONBIT_RC_COUNT_UNIT ((int32_t)(1u << MOONBIT_RC_COUNT_SHIFT))
+#define raw_rc_is_dynamic(rc) ((int32_t)(rc) >= MOONBIT_RC_COUNT_UNIT)
+#define raw_rc_is_shared(rc) ((int32_t)(rc) >= (MOONBIT_RC_COUNT_UNIT * 2))
+
+static inline int32_t moonbit_unsafe_obj_cycle_capable(void *ptr) {
+  return MOONBIT_IN_ROOT(ptr) ||
+         !MOONBIT_CHECK_CYCLE_STATUS(
+             ptr, moonbit_CYCLE_STATUS_ACYCLIC_OR_CANDIDATE);
+}
+
+extern const uint32_t *moonbit_layout_table;
+
 static void moonbit_incref_inlined(void *ptr) {
   struct moonbit_object *header = Moonbit_object_header(ptr);
-  int32_t const count = header->rc;
-  if (count > 0) {
-    header->rc = count + 1;
+  int32_t const rc = header->rc;
+  if (raw_rc_is_dynamic(rc)) {
+    Moonbit_increase_rc_count(header);
   }
 }
 
@@ -90,17 +123,59 @@ static void moonbit_incref_inlined(void *ptr) {
 
 static void moonbit_decref_inlined(void *ptr) {
   struct moonbit_object *header = Moonbit_object_header(ptr);
-  int32_t const count = header->rc;
-  if (count > 1) {
-    header->rc = count - 1;
-  } else if (count == 1) {
+  int32_t const rc = header->rc;
+  if (raw_rc_is_shared(rc)) {
+    header->rc = rc - MOONBIT_RC_COUNT_UNIT;
+  } else if (raw_rc_is_dynamic(rc)) {
     moonbit_drop_object(ptr);
   }
 }
 
 #define moonbit_decref moonbit_decref_inlined
 
+// Value-enum retain/release: inline the cheap "does the current variant carry
+// references?" test (a header read + class compare) so scalar-tag moves pay no
+// call, and delegate the reference-walking loop to the out-of-line slow path in
+// runtime.c. Mirrors the moonbit_incref/decref fast/slow split above.
+static inline void moonbit_incref_value_enum_inlined(void *p) {
+  if (Moonbit_header_layout_class(*(uint32_t *)p) ==
+      MOONBIT_REGULAR_LAYOUT_CLASS_INDEXED)
+    moonbit_incref_value_enum_loop(p);
+}
+
+#define moonbit_incref_value_enum moonbit_incref_value_enum_inlined
+
+static inline void moonbit_decref_value_enum_inlined(void *p) {
+  if (Moonbit_header_layout_class(*(uint32_t *)p) ==
+      MOONBIT_REGULAR_LAYOUT_CLASS_INDEXED)
+    moonbit_decref_value_enum_loop(p);
+}
+
+#define moonbit_decref_value_enum moonbit_decref_value_enum_inlined
+
 #define moonbit_unsafe_make_string moonbit_make_string
+
+#if defined(MOONBIT_V128_NEON)
+#define Moonbit_v128_make(lo, hi)                                             \
+  vreinterpretq_u8_u64(                                                       \
+      vcombine_u64(vcreate_u64((uint64_t)(lo)), vcreate_u64((uint64_t)(hi))))
+#define Moonbit_v128_lo(v) vgetq_lane_u64(vreinterpretq_u64_u8(v), 0)
+#define Moonbit_v128_hi(v) vgetq_lane_u64(vreinterpretq_u64_u8(v), 1)
+#define Moonbit_v128_load_storage(p) vld1q_u8((const uint8_t *)(p))
+#define Moonbit_v128_store_storage(p, v) vst1q_u8((uint8_t *)(p), (v))
+#elif defined(MOONBIT_V128_SSE2)
+#define Moonbit_v128_make(lo, hi) _mm_set_epi64x((int64_t)(hi), (int64_t)(lo))
+#define Moonbit_v128_lo(v) ((uint64_t)_mm_cvtsi128_si64(v))
+#define Moonbit_v128_hi(v) ((uint64_t)_mm_cvtsi128_si64(_mm_srli_si128((v), 8)))
+#define Moonbit_v128_load_storage(p) _mm_loadu_si128((const __m128i *)(p))
+#define Moonbit_v128_store_storage(p, v) _mm_storeu_si128((__m128i *)(p), (v))
+#else
+#define Moonbit_v128_make(lo, hi) ((moonbit_v128_t){(lo), (hi)})
+#define Moonbit_v128_lo(v) ((v).lo)
+#define Moonbit_v128_hi(v) ((v).hi)
+#define Moonbit_v128_load_storage(p) (*(p))
+#define Moonbit_v128_store_storage(p, v) (*(p) = (v))
+#endif
 
 // detect whether compiler builtins exist for advanced bitwise operations
 #ifdef __has_builtin
