@@ -18,6 +18,16 @@
 extern "C" {
 #endif
 
+// `moonbit.h` can include <stdlib.h> through system headers
+// (for example math.h -> xmmintrin.h -> stdlib.h in mingw-w64).
+// mingw-w64 declares `rand_s` only if `_CRT_RAND_S` is defined
+// before the first include of <stdlib.h>, so define it here.
+#if defined(_WIN32) && !defined(_MSC_VER) && !defined(MOONBIT_NATIVE_NO_SYS_HEADER)
+#ifndef _CRT_RAND_S
+#define _CRT_RAND_S
+#endif
+#endif
+
 #define MOONBIT_BUILD_RUNTIME
 #include "moonbit.h"
 #include "moonbit_runtime.h"
@@ -47,10 +57,6 @@ size_t strlen(const char *s);
 #pragma comment(lib, "Bcrypt.lib")
 
 #else
-
-#ifndef _CRT_RAND_S
-#define _CRT_RAND_S
-#endif
 
 #include <stdio.h>
 #include <string.h>
