@@ -19,6 +19,7 @@ extern "C" {
 #endif
 
 #include "moonbit.h"
+#include "moonbit_runtime.h"
 #include "moonbit_simd.h"
 
 #ifdef _MSC_VER
@@ -28,6 +29,12 @@ extern "C" {
 #if defined(__clang__)
 #pragma clang diagnostic ignored "-Wshift-op-parentheses"
 #pragma clang diagnostic ignored "-Wtautological-compare"
+#endif
+
+// TinyCC's in-memory run mode has no executable of its own; an OS lookup would
+// report the host process instead.
+#if defined(__TCC_RUN__)
+#define moonbit_rt_get_current_exe moonbit_rt_get_current_exe_tcc
 #endif
 
 MOONBIT_EXPORT _Noreturn void moonbit_panic(void);
@@ -57,6 +64,7 @@ MOONBIT_EXPORT int32_t moonbit_unsafe_ref_array_blit(void *dst,
                                                      int32_t src_offset,
                                                      int32_t len);
 MOONBIT_EXPORT void moonbit_println(moonbit_string_t str);
+MOONBIT_EXPORT void moonbit_eprintln(moonbit_string_t str);
 MOONBIT_EXPORT moonbit_bytes_t *moonbit_get_cli_args(void);
 MOONBIT_EXPORT void moonbit_runtime_init(int argc, char **argv);
 MOONBIT_EXPORT void moonbit_drop_object(void *);
@@ -90,28 +98,33 @@ void free(void *ptr);
 
 // several important runtime functions are inlined
 static void *moonbit_malloc_inlined(size_t size) {
-  struct moonbit_object *ptr = (struct moonbit_object *)libc_malloc(
+#if MOONBIT_TRIAL_DELETION &&                                      \
+    MOONBIT_ALLOCATOR == MOONBIT_ALLOCATOR_SYSTEM
+  // System-allocator builds collect at allocation safe points. Mimalloc
+  // builds use its registered deferred-free callback instead.
+  if (moonbit_cycle_collection_threshold()) {
+    moonbit_collect_cycles();
+  }
+#endif
+  struct moonbit_object *ptr = (struct moonbit_object *)MOONBIT_MALLOC_RAW(
       sizeof(struct moonbit_object) + size);
   Moonbit_init_dynamic_rc(ptr, moonbit_BLOCK_KIND_REGULAR);
   return ptr + 1;
 }
 
 #define moonbit_malloc(obj) moonbit_malloc_inlined(obj)
-#define moonbit_free(obj) libc_free(Moonbit_object_header(obj))
 
 #define MOONBIT_RC_COUNT_UNIT ((int32_t)(1u << MOONBIT_RC_COUNT_SHIFT))
 #define raw_rc_is_dynamic(rc) ((int32_t)(rc) >= MOONBIT_RC_COUNT_UNIT)
 #define raw_rc_is_shared(rc) ((int32_t)(rc) >= (MOONBIT_RC_COUNT_UNIT * 2))
 
-static inline int32_t moonbit_unsafe_obj_cycle_capable(void *ptr) {
-  return MOONBIT_IN_ROOT(ptr) ||
-         !MOONBIT_CHECK_CYCLE_STATUS(
-             ptr, moonbit_CYCLE_STATUS_ACYCLIC_OR_CANDIDATE);
-}
-
 extern const uint32_t *moonbit_layout_table;
 
-static void moonbit_incref_inlined(void *ptr) {
+#define moonbit_is_unique_ptr moonbit_is_unique_ptr_inlined
+
+// The compiler only emits this retain for references whose static type cannot
+// participate in a cycle. They never need trial-deletion liveness bookkeeping.
+static void moonbit_incref_cycle_free_inlined(void *ptr) {
   struct moonbit_object *header = Moonbit_object_header(ptr);
   int32_t const rc = header->rc;
   if (raw_rc_is_dynamic(rc)) {
@@ -119,13 +132,37 @@ static void moonbit_incref_inlined(void *ptr) {
   }
 }
 
+#define moonbit_incref_cycle_free moonbit_incref_cycle_free_inlined
+
+static void moonbit_incref_inlined(void *ptr) {
+  struct moonbit_object *header = Moonbit_object_header(ptr);
+  int32_t const rc = header->rc;
+  if (raw_rc_is_dynamic(rc)) {
+    Moonbit_increase_rc_count(header);
+    MOONBIT_MARK_LIVE(ptr);
+  }
+}
+
 #define moonbit_incref moonbit_incref_inlined
+
+static void moonbit_decref_cycle_free_inlined(void *ptr) {
+  struct moonbit_object *header = Moonbit_object_header(ptr);
+  int32_t const rc = header->rc;
+  if (raw_rc_is_shared(rc)) {
+    header->rc = rc - MOONBIT_RC_COUNT_UNIT;
+  } else if (raw_rc_is_dynamic(rc)) {
+    moonbit_drop_object(ptr);
+  }
+}
+
+#define moonbit_decref_cycle_free moonbit_decref_cycle_free_inlined
 
 static void moonbit_decref_inlined(void *ptr) {
   struct moonbit_object *header = Moonbit_object_header(ptr);
   int32_t const rc = header->rc;
   if (raw_rc_is_shared(rc)) {
     header->rc = rc - MOONBIT_RC_COUNT_UNIT;
+    MOONBIT_ADD_POSSIBLE_ROOT(ptr);
   } else if (raw_rc_is_dynamic(rc)) {
     moonbit_drop_object(ptr);
   }
@@ -335,6 +372,44 @@ int32_t moonbit_popcnt64(uint64_t x) {
   return (x * 0x0101010101010101) >> 56;
 }
 #endif
+
+/* Full 64x64->128 multiplication. Write directly into the destination value
+   struct so the generated code does not depend on a matching runtime struct
+   layout. Compilers without native 128-bit integers (e.g. tcc, MSVC) use the
+   32x32 schoolbook decomposition. */
+static inline void moonbit_umul_wide(uint64_t *out_lo, uint64_t *out_hi,
+                                     uint64_t a, uint64_t b) {
+#if defined(__SIZEOF_INT128__)
+  unsigned __int128 r = (unsigned __int128)a * (unsigned __int128)b;
+  *out_lo = (uint64_t)r;
+  *out_hi = (uint64_t)(r >> 64);
+#else
+  uint64_t alo = a & 0xffffffff, ahi = a >> 32;
+  uint64_t blo = b & 0xffffffff, bhi = b >> 32;
+  uint64_t ll = alo * blo;
+  uint64_t lh = alo * bhi;
+  uint64_t hl = ahi * blo;
+  uint64_t hh = ahi * bhi;
+  uint64_t mid = (ll >> 32) + (lh & 0xffffffff) + (hl & 0xffffffff);
+  *out_lo = a * b;
+  *out_hi = hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
+#endif
+}
+
+static inline void moonbit_smul_wide(uint64_t *out_lo, int64_t *out_hi,
+                                     int64_t a, int64_t b) {
+#if defined(__SIZEOF_INT128__)
+  __int128 r = (__int128)a * (__int128)b;
+  *out_lo = (uint64_t)r;
+  *out_hi = (int64_t)(r >> 64);
+#else
+  uint64_t hi;
+  moonbit_umul_wide(out_lo, &hi, (uint64_t)a, (uint64_t)b);
+  uint64_t correction_a = a < 0 ? (uint64_t)b : 0;
+  uint64_t correction_b = b < 0 ? (uint64_t)a : 0;
+  *out_hi = (int64_t)(hi - correction_a - correction_b);
+#endif
+}
 
 /* The following sqrt implementation comes from
    [musl](https://git.musl-libc.org/cgit/musl),

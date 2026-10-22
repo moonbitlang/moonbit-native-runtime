@@ -18,6 +18,7 @@
 #define moonbit_simd_h_INCLUDED
 
 #include "moonbit.h"
+#include "moonbit_runtime.h"
 
 #ifdef __cplusplus
 extern "C" {

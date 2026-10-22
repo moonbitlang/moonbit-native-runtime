@@ -1,0 +1,117 @@
+/*
+ * Copyright 2025 International Digital Economy Academy
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <moonbit.h>
+
+#ifdef __linux__
+
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/epoll.h>
+#include <sys/wait.h>
+
+_Noreturn void moonbit_panic();
+
+MOONBIT_EXPORT
+int moonbit_rt_event_bus_create() {
+  return epoll_create1(EPOLL_CLOEXEC);
+}
+
+MOONBIT_EXPORT
+void moonbit_rt_event_bus_destroy(int epfd) {
+  close(epfd);
+}
+
+/* return value:
+   `-1` => failure
+   `0` => fd not supported
+   `1` => successfully registered
+ */
+MOONBIT_EXPORT
+int32_t moonbit_rt_event_bus_register(int epfd, int fd, int32_t read_only) {
+  // File descriptors registered with the event bus
+  // should always be used in a non-blocking manner, due to our use of `EPOLLET`.
+  // Error is intentionally omitted here, because some special file descriptors,
+  // such as `inotify` instance, may not have the concept of blocking/nonblocking at all.
+  int fd_flags = fcntl(fd, F_GETFL);
+  if (fd_flags >= 0 && !(fd_flags & O_NONBLOCK))
+    fcntl(fd, F_SETFL, fd_flags | O_NONBLOCK);
+
+  int events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+  if (!read_only)
+    events |= EPOLLOUT;
+
+  epoll_data_t data;
+  data.u64 = fd;
+  struct epoll_event event = { events, data };
+  int ret = epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event);
+  if (ret >= 0)
+    return 1;
+  else if (errno == EPERM)
+    return 0;
+  else
+    return -1;
+}
+
+MOONBIT_EXPORT
+int moonbit_rt_event_bus_register_pid(int epfd, pid_t pid) {
+  moonbit_panic();
+}
+
+MOONBIT_EXPORT
+int32_t moonbit_rt_event_bus_remove(int epfd, int fd) {
+  // `epoll` is description based. Even after closing a fd,
+  // we may still receive stale events.
+  // Things get worse if the fd number is later reused.
+  // Hence we must manually unregister a fd before closing it.
+  return epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+}
+
+#define EVENT_BUFFER_SIZE 1024
+static struct epoll_event event_buffer[EVENT_BUFFER_SIZE];
+
+MOONBIT_EXPORT
+int moonbit_rt_event_bus_wait(int epfd, int timeout) {
+  return epoll_wait(epfd, event_buffer, EVENT_BUFFER_SIZE, timeout);
+}
+
+// wrapper for handling event list
+MOONBIT_EXPORT
+struct epoll_event* moonbit_rt_event_list_get(int epfd, int index) {
+  return event_buffer + index;
+}
+
+MOONBIT_EXPORT
+int moonbit_rt_event_get_fd(struct epoll_event *ev) {
+  return ev->data.u64;
+}
+
+MOONBIT_EXPORT
+int moonbit_rt_event_get_events(struct epoll_event *ev) {
+  if (ev->events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP))
+    return 3;
+
+  int result = 0;
+  if (ev->events & EPOLLIN)
+    result |= 1;
+  if (ev->events & EPOLLOUT)
+    result |= 2;
+
+  return result;
+}
+
+#endif
