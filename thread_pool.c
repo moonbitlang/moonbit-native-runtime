@@ -156,6 +156,16 @@ void moonbit_rt_free_job(void *payload_ptr) {
   free(job);
 }
 
+// Execute a fresh job on the calling thread. The caller owns the job until
+// free_job and must not submit it again or free it during execution. This only
+// fills the usual result fields; worker scheduling and notification stay outside.
+MOONBIT_EXPORT
+void moonbit_rt_run_job_sync(void *payload_ptr) {
+  struct job *job = JOB_HEADER(payload_ptr);
+  job->err = 0;
+  job->ret = job->worker(job->payload, &job->err);
+}
+
 MOONBIT_EXPORT
 int32_t moonbit_rt_job_get_ret(void *job) {
   return JOB_HEADER(job)->ret;
@@ -275,8 +285,7 @@ thread_worker_result_t THREAD_PROC_CALLING_CONVENTION worker_loop(void *data) {
 #endif
 
   while (job) {
-    job->err = 0;
-    job->ret = job->worker(job->payload, &job->err);
+    moonbit_rt_run_job_sync(job->payload);
 
     self->state = Waiting;
     self->inside_cancellable_region = 0;
